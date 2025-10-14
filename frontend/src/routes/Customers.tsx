@@ -1,121 +1,135 @@
-import React, { useEffect, useState } from 'react'
+// frontend/src/routes/Customers.tsx
+import React, { useEffect, useMemo, useState } from 'react'
 import AppShell from '../components/layout/AppShell'
-import Card, { CardContent, CardHeader } from '../components/ui/Card'
-import Table, { TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/Table'
+import Card, { CardHeader, CardContent } from '../components/ui/Card'
+import Table, { TableHeader, TableRow, TableHead, TableBody, TableCell } from '../components/ui/Table'
 import Button from '../components/ui/Button'
+import Input from '../components/ui/Input'
 import Spinner from '../components/ui/Spinner'
 import Alert from '../components/ui/Alert'
-import Input from '../components/ui/Input'
-import { supabase } from '../lib/supabaseClient'
 import { useNavigate } from 'react-router-dom'
 
-type Customer = { id: string; name: string }
-type ApiResponse = { page: number; pageSize: number; total: number; customers: Customer[] }
 
-const PAGE_SIZE = 15
+type Customer = { id: string; name: string }
+type ApiList = { items: Customer[]; total: number; page: number; pageSize: number }
 
 export default function Customers() {
-  const [page, setPage] = useState(1)
-  const [total, setTotal] = useState(0)
-  const [rows, setRows] = useState<Customer[]>([])
-  const [loading, setLoading] = useState(true)
-  const [err, setErr] = useState<string | null>(null)
-  const [query, setQuery] = useState('')
   const navigate = useNavigate()
 
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  // UI state
+  const [page, setPage] = useState(1)
+  const pageSize = 15
+  const [q, setQ] = useState('')
+  const [typing, setTyping] = useState('') // for debounced search box
 
-  async function fetchCustomers() {
+  // data state
+  const [items, setItems] = useState<Customer[]>([])
+  const [total, setTotal] = useState(0)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Debounce search input (300ms)
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setQ(typing.trim())
+      setPage(1) // reset to first page when searching
+    }, 300)
+    return () => clearTimeout(t)
+  }, [typing])
+
+  async function load() {
     setLoading(true)
-    setErr(null)
+    setError(null)
     try {
-      const token = (await supabase.auth.getSession()).data.session?.access_token
-      if (!token) throw new Error('Not authenticated')
+      const params = new URLSearchParams()
+      params.set('page', String(page))
+      params.set('pageSize', String(pageSize))
+      if (q) params.set('q', q)
 
-      const params = new URLSearchParams({
-        page: String(page),
-        pageSize: String(PAGE_SIZE),
-      })
-      if (query.trim()) params.append('q', query.trim())
+      const res = await fetch(`${(import.meta as any).env.VITE_API_BASE}/api/customers?` + params.toString())
+      const json: Partial<ApiList> = await res.json()
+      if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`)
 
-      const res = await fetch(`${(import.meta as any).env.VITE_API_BASE}/api/customers?` + params.toString(), {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      const data: ApiResponse = await res.json()
-      if (!res.ok) throw new Error((data as any)?.error || `HTTP ${res.status}`)
-      setRows(data.customers)
-      setTotal(data.total)
+      // defensive defaults to avoid .map on undefined
+      setItems(Array.isArray(json.items) ? json.items : [])
+      setTotal(typeof json.total === 'number' ? json.total : 0)
     } catch (e: any) {
-      setErr(e.message || 'Failed to load customers')
+      setError(e.message || 'Failed to load customers')
+      setItems([])
+      setTotal(0)
     } finally {
       setLoading(false)
     }
   }
 
-  useEffect(() => {
-    fetchCustomers()
-  }, [page])
+  useEffect(() => { load() }, [page, q])
 
-  const prevDisabled = page <= 1
-  const nextDisabled = page >= totalPages
+  const totalPages = useMemo(() => Math.max(1, Math.ceil(total / pageSize)), [total])
+
+  const canPrev = page > 1
+  const canNext = page < totalPages
 
   return (
     <AppShell>
       <div className="space-y-6">
-        {/* Header + Search */}
-        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900">Customers</h1>
-            <p className="text-gray-600">Search or browse customers ({PAGE_SIZE} per page)</p>
-          </div>
-          <div className="flex items-center gap-2">
+        <div className="flex flex-col md:flex-row md:items-center gap-3">
+          <h1 className="text-2xl font-bold text-gray-900">Customers</h1>
+          <div className="md:ml-auto w-full md:w-96">
             <Input
-              placeholder="Search customer..."
-              value={query}
-              onChange={e => setQuery(e.target.value)}
-              style={{ width: '220px' }}
+              label="Search customers"
+              placeholder="Type a name…"
+              value={typing}
+              onChange={e => setTyping(e.target.value)}
             />
-            <Button onClick={() => { setPage(1); fetchCustomers() }}>Search</Button>
           </div>
         </div>
 
-        {/* Pagination Controls */}
-        <div className="flex justify-end items-center gap-2">
-          <Button variant="secondary" onClick={() => setPage(1)} disabled={prevDisabled}>« First</Button>
-          <Button variant="secondary" onClick={() => setPage(p => Math.max(1, p - 1))} disabled={prevDisabled}>‹ Prev</Button>
-          <span className="text-sm text-gray-700 px-2">
-            Page <span className="font-semibold">{page}</span> of <span className="font-semibold">{totalPages}</span>
-          </span>
-          <Button variant="secondary" onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={nextDisabled}>Next ›</Button>
-          <Button variant="secondary" onClick={() => setPage(totalPages)} disabled={nextDisabled}>Last »</Button>
-        </div>
-
-        {loading && (
-          <div className="flex items-center space-x-2">
-            <Spinner size="sm" />
-            <span className="text-gray-600">Loading…</span>
-          </div>
-        )}
-        {err && <Alert variant="error">{err}</Alert>}
-
-        {!loading && !err && (
-          <Card>
-            <CardHeader>
-              <h3 className="text-lg font-semibold text-gray-900">All Customers</h3>
-            </CardHeader>
-            <CardContent>
+        <Card>
+          <CardHeader>
+            <div className="flex items-center justify-between">
+              <div className="text-sm text-gray-600">
+                {loading ? 'Loading…' : `Showing ${items.length} of ${total} customers`}
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={!canPrev || loading}
+                  onClick={() => setPage(p => Math.max(1, p - 1))}
+                >
+                  ← Prev
+                </Button>
+                <span className="text-sm text-gray-700">
+                  Page {page} / {totalPages}
+                </span>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={!canNext || loading}
+                  onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                >
+                  Next →
+                </Button>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent>
+            {error && <Alert variant="error">{error}</Alert>}
+            {loading ? (
+              <div className="flex items-center gap-2 text-gray-600"><Spinner size="sm" /> Loading…</div>
+            ) : (
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-[80px]">#</TableHead>
-                    <TableHead>Customer Name</TableHead>
+                    <TableHead className="w-[64px]">#</TableHead>
+                    <TableHead>Name</TableHead>
                     <TableHead className="text-right w-[140px]">Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {rows.map((c, idx) => (
+                  {(items ?? []).map((c, i) => (
                     <TableRow key={c.id}>
-                      <TableCell>{(page - 1) * PAGE_SIZE + idx + 1}</TableCell>
+                      <TableCell>{(page - 1) * pageSize + i + 1}</TableCell>
                       <TableCell className="font-medium">{c.name}</TableCell>
                       <TableCell className="text-right">
                         <Button size="sm" onClick={() => navigate(`/customers/${c.id}`)}>
@@ -124,18 +138,16 @@ export default function Customers() {
                       </TableCell>
                     </TableRow>
                   ))}
-                  {rows.length === 0 && (
+                  {(items ?? []).length === 0 && !loading && !error && (
                     <TableRow>
-                      <TableCell colSpan={3} className="text-center text-gray-500">
-                        No customers found.
-                      </TableCell>
+                      <TableCell colSpan={3} className="text-center text-gray-500">No customers found.</TableCell>
                     </TableRow>
                   )}
                 </TableBody>
               </Table>
-            </CardContent>
-          </Card>
-        )}
+            )}
+          </CardContent>
+        </Card>
       </div>
     </AppShell>
   )

@@ -1,185 +1,237 @@
+// frontend/src/routes/ProductDetail.tsx
 import React, { useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import AppShell from '../components/layout/AppShell'
-import Card, { CardContent, CardHeader } from '../components/ui/Card'
-import Table, { TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/Table'
+import Card, { CardHeader, CardContent } from '../components/ui/Card'
 import Spinner from '../components/ui/Spinner'
 import Alert from '../components/ui/Alert'
+import Table, { TableHeader, TableRow, TableHead, TableBody, TableCell } from '../components/ui/Table'
+import { LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import Button from '../components/ui/Button'
-import { supabase } from '../lib/supabaseClient'
-import { LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts'
 
-type Monthly = { month: string; qty: number }
+type MonthlyPoint = { month: string; qty: number }
 type TopCustomer = { customer_id: string; customer_name: string; qty: number }
-type Seasonality = { month_num: number; avg_qty: number }
-
-type Overview = {
+type ApiResp = {
   product: { id: string; name: string }
-  monthly: Monthly[]
-  seasonality: Seasonality[]
-  topCustomers: TopCustomer[]
-  pricing: { average_selling_price: number; current_unit_cost: number; current_unit_price: number }
-  profit_window: { months: number; total_qty: number; total_revenue: number; unit_cost_used: number; gross_profit: number }
-  stats12: { weighted_avg_12m: number; sigma_12m: number }
-  inventory: { on_hand: number; backorder: number }
+  monthly: MonthlyPoint[]
+  seasonality?: { month_num: number; avg_qty: number }[]
+  topCustomers?: TopCustomer[]
+  pricing?: { average_selling_price: number | null; current_unit_cost: number | null; current_unit_price: number | null }
+  profit_window?: { mode: string; year?: number; total_qty: number; total_revenue: number; unit_cost_used: number; gross_profit: number }
+  stats12?: { weighted_avg_12m: number; sigma_12m: number; weighted_moq?: number }
+  inventory?: { on_hand: number; backorder: number }
 }
-
-const MONTH_LABEL = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-const ALLOWED = [12, 24, 48, 72, 96] // extend as you wish
 
 export default function ProductDetail() {
   const { id } = useParams()
-  const [months, setMonths] = useState<number>(12)
-  const [data, setData] = useState<Overview | null>(null)
+
+  // view state
+  const [mode, setMode] = useState<'last12' | 'year'>('last12')
+  const [year, setYear] = useState<number>(new Date().getFullYear())
+
+  const [data, setData] = useState<ApiResp | null>(null)
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState<string | null>(null)
 
+  const years = useMemo(() => {
+    const y = new Date().getFullYear()
+    return Array.from({ length: 8 }, (_, i) => y - i)
+  }, [])
+
   async function load() {
+    if (!id) return
     setLoading(true)
     setErr(null)
     try {
-      const token = (await supabase.auth.getSession()).data.session?.access_token
-      if (!token) throw new Error('Not authenticated')
-      const res = await fetch(`${(import.meta as any).env.VITE_API_BASE}/api/products/${id}/overview?months=${months}&top=5`, {
-        headers: { Authorization: `Bearer ${token}` }
-      })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+      const params = new URLSearchParams()
+      params.set('mode', mode)
+      if (mode === 'year') params.set('year', String(year))
+      params.set('top', '5')
+
+      const res = await fetch(`${(import.meta as any).env.VITE_API_BASE}/api/products/${id}/overview?` + params.toString())
+      const json: ApiResp = await res.json()
+      if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`)
       setData(json)
     } catch (e: any) {
       setErr(e.message || 'Failed to load product')
+      setData(null)
     } finally {
       setLoading(false)
     }
   }
 
-  useEffect(() => { load() }, [id, months])
+  useEffect(() => { load() }, [id, mode, year])
 
-  const monthlyChartData = useMemo(
-    () => (data?.monthly ?? []).map(m => ({ ...m, label: m.month.slice(0,7) })),
-    [data]
-  )
-  const seasonalityData = useMemo(
-    () => (data?.seasonality ?? []).map(s => ({ ...s, label: MONTH_LABEL[s.month_num - 1] })),
-    [data]
-  )
+  // safe getters
+  const asp = data?.pricing?.average_selling_price ?? null
+  const unitCost = data?.pricing?.current_unit_cost ?? null
+  const weightedMOQ = data?.stats12?.weighted_moq ?? 0
+  const sigma12 = data?.stats12?.sigma_12m ?? 0
+
+  const qtyLast12 = useMemo(() => {
+    const arr = data?.monthly ?? []
+    const last12 = arr.slice(-12)
+    return last12.reduce((s, r) => s + Number(r.qty || 0), 0)
+  }, [data?.monthly])
+
+  const grossProfit = data?.profit_window?.gross_profit ?? null
 
   return (
     <AppShell>
       <div className="space-y-6">
-        {loading && (<div className="flex items-center space-x-2"><Spinner size="sm" /><span className="text-gray-600">Loading…</span></div>)}
+        {loading && (
+          <div className="flex items-center gap-2 text-gray-600">
+            <Spinner size="sm" /> Loading…
+          </div>
+        )}
         {err && <Alert variant="error">{err}</Alert>}
 
         {!loading && !err && data && (
           <>
             {/* Header */}
-            <div className="flex items-end justify-between flex-wrap gap-4">
+            <div className="flex flex-wrap items-center gap-3">
               <div>
                 <h1 className="text-2xl font-bold text-gray-900">{data.product.name}</h1>
-                <p className="text-gray-600">Sales, seasonality, prices & profit</p>
+                <p className="text-gray-600">Product analytics</p>
               </div>
 
-              {/* Months selector */}
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-gray-600">Months:</span>
-                {ALLOWED.map(m => (
-                  <Button key={m} size="sm" variant={months === m ? 'primary' : 'secondary'} onClick={() => setMonths(m)}>
-                    {m}
-                  </Button>
-                ))}
+              {/* Toggle controls */}
+              <div className="ml-auto flex items-center gap-3">
+                <div className="inline-flex rounded-lg bg-gray-100 p-1">
+                  <button
+                    className={`px-3 py-1 rounded-md text-sm ${mode==='last12' ? 'bg-white shadow font-medium' : 'text-gray-600'}`}
+                    onClick={() => setMode('last12')}
+                  >
+                    Last 12 months
+                  </button>
+                  <button
+                    className={`px-3 py-1 rounded-md text-sm ${mode==='year' ? 'bg-white shadow font-medium' : 'text-gray-600'}`}
+                    onClick={() => setMode('year')}
+                  >
+                    Specific year
+                  </button>
+                </div>
+
+                {mode === 'year' && (
+                  <select
+                    className="rounded-md border border-gray-300 bg-white px-2 py-1 text-sm"
+                    value={year}
+                    onChange={e => setYear(Number(e.target.value))}
+                  >
+                    {years.map(y => <option key={y} value={y}>{y}</option>)}
+                  </select>
+                )}
+
+                <Button size="sm" onClick={load} disabled={loading}>Refresh</Button>
               </div>
             </div>
 
-            {/* Pricing & Profit (concise KPIs; removed previous cards you highlighted) */}
+            {/* KPI row 1 */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-              <Card><CardContent className="p-6">
-                <p className="text-sm text-gray-600">Avg Selling Price (ASP)</p>
-                <p className="text-2xl font-bold text-gray-900">{data.pricing.average_selling_price.toFixed(2)}</p>
-              </CardContent></Card>
-              <Card><CardContent className="p-6">
-                <p className="text-sm text-gray-600">Unit Cost (current)</p>
-                <p className="text-2xl font-bold text-gray-900">{data.pricing.current_unit_cost.toFixed(2)}</p>
-              </CardContent></Card>
-              <Card><CardContent className="p-6">
-                <p className="text-sm text-gray-600">Qty (last {months})</p>
-                <p className="text-2xl font-bold text-gray-900">{data.profit_window.total_qty}</p>
-              </CardContent></Card>
-              <Card><CardContent className="p-6">
-                <p className="text-sm text-gray-600">Gross Profit (last {months})</p>
-                <p className="text-2xl font-bold text-gray-900">{data.profit_window.gross_profit.toFixed(2)}</p>
-              </CardContent></Card>
+              <Card>
+                <CardContent className="p-6">
+                  <p className="text-sm text-gray-600">Avg Selling Price (ASP)</p>
+                  <p className="text-2xl font-bold text-gray-900">
+                    {asp != null ? Number(asp).toFixed(2) : '—'}
+                  </p>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardContent className="p-6">
+                  <p className="text-sm text-gray-600">Unit Cost (current)</p>
+                  <p className="text-2xl font-bold text-gray-900">
+                    {unitCost != null ? Number(unitCost).toFixed(2) : '—'}
+                  </p>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardContent className="p-6">
+                  <p className="text-sm text-gray-600">Qty (last 12)</p>
+                  <p className="text-2xl font-bold text-gray-900">{qtyLast12.toLocaleString()}</p>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardContent className="p-6">
+                  <p className="text-sm text-gray-600">Gross Profit ({mode === 'year' ? year : 'last 12'})</p>
+                  <p className="text-2xl font-bold text-gray-900">
+                    {grossProfit != null ? Number(grossProfit).toFixed(2) : '—'}
+                  </p>
+                </CardContent>
+              </Card>
             </div>
 
-            {/* Monthly Sales — last N months (zero-filled) */}
+            {/* KPI row 2 – Weighted MOQ + σ */}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+              <Card>
+                <CardContent className="p-6">
+                  <p className="text-sm text-gray-600">Weighted MOQ (4 mo)</p>
+                  <p className="text-2xl font-bold text-gray-900">
+                    {Number(weightedMOQ || 0).toLocaleString()}
+                  </p>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardContent className="p-6">
+                  <p className="text-sm text-gray-600">σ (12m)</p>
+                  <p className="text-2xl font-bold text-gray-900">
+                    {Number(sigma12 || 0).toFixed(2)}
+                  </p>
+                </CardContent>
+              </Card>
+            </div>
+
+            {/* Monthly chart */}
             <Card>
               <CardHeader>
-                <h3 className="text-lg font-semibold text-gray-900">Monthly Sales (qty) — last {months} months</h3>
+                <h3 className="text-lg font-semibold text-gray-900">
+                  Monthly Sales (Qty) — {mode === 'year' ? year : 'Last 12 months'}
+                </h3>
               </CardHeader>
               <CardContent>
                 <div className="h-80">
                   <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={monthlyChartData}>
+                    <LineChart data={(data.monthly ?? []).map(m => ({ ...m, label: String(m.month).slice(0, 7) }))}>
                       <CartesianGrid strokeDasharray="3 3" />
                       <XAxis dataKey="label" />
                       <YAxis />
                       <Tooltip />
-                      <Line type="monotone" dataKey="qty" dot={false} />
+                      <Line type="monotone" dataKey="qty" dot={false} stroke="#2563eb" />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
               </CardContent>
             </Card>
 
-            {/* Seasonality — last 12 months only */}
+            {/* Top customers */}
             <Card>
               <CardHeader>
-                <h3 className="text-lg font-semibold text-gray-900">Seasonality (avg qty by calendar month, last 12 months)</h3>
-              </CardHeader>
-              <CardContent>
-                <div className="h-80">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={seasonalityData}>
-                      <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis dataKey="label" />
-                      <YAxis />
-                      <Tooltip />
-                      <Bar dataKey="avg_qty" />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              </CardContent>
-            </Card>
-
-            {/* Top Customers (up to 5) */}
-            <Card>
-              <CardHeader>
-                <h3 className="text-lg font-semibold text-gray-900">Top Customers (up to 5)</h3>
+                <h3 className="text-lg font-semibold text-gray-900">Top Customers</h3>
               </CardHeader>
               <CardContent>
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead>#</TableHead>
+                      <TableHead className="w-[60px]">#</TableHead>
                       <TableHead>Customer</TableHead>
-                      <TableHead className="text-right">Total Qty</TableHead>
-                      <TableHead className="text-right">Action</TableHead>
+                      <TableHead className="text-right">Qty</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {data.topCustomers.map((c, idx) => (
+                    {(data.topCustomers ?? []).map((c, i) => (
                       <TableRow key={c.customer_id}>
-                        <TableCell>{idx + 1}</TableCell>
+                        <TableCell>{i + 1}</TableCell>
                         <TableCell className="font-medium">{c.customer_name}</TableCell>
                         <TableCell className="text-right">{c.qty}</TableCell>
-                        <TableCell className="text-right">
-                          <Button size="sm" variant="secondary" onClick={() => window.open(`/customers/${c.customer_id}`, '_blank')}>
-                            View Customer
-                          </Button>
-                        </TableCell>
                       </TableRow>
                     ))}
-                    {data.topCustomers.length === 0 && (
-                      <TableRow><TableCell colSpan={4} className="text-center text-gray-500">No customers yet.</TableCell></TableRow>
+                    {(data.topCustomers ?? []).length === 0 && (
+                      <TableRow>
+                        <TableCell colSpan={3} className="text-center text-gray-500">No data.</TableCell>
+                      </TableRow>
                     )}
                   </TableBody>
                 </Table>
