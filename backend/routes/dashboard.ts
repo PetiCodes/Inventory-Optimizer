@@ -111,10 +111,13 @@ router.get('/dashboard/overview', async (_req, res) => {
       gross_profit_12m: number
     }
 
-    // Get product names once
     const allProds = await supabaseService.from('products').select('id,name')
     if (allProds.error) return res.status(500).json({ error: allProds.error.message })
-    const nameMap = new Map(allProds.data?.map(p => [String(p.id), p.name]))
+
+    const nameMap = new Map<string, string>(
+    (allProds.data ?? []).map((p: any) => [String(p.id), String(p.name ?? 'Unknown')])
+)
+
 
     // Compute per-product metrics
     const atRisk: AtRiskRow[] = []
