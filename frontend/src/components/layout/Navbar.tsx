@@ -1,6 +1,5 @@
 import React from 'react'
 import { supabase } from '../../lib/supabaseClient'
-import { useSession } from '../../lib/sessionProvider'
 import Button from '../ui/Button'
 
 export default function Navbar() {
