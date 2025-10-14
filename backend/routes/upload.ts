@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
-import { supabaseService } from '../src/supabase'
+import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } })
