@@ -5,13 +5,13 @@ import cors from 'cors'
 import morgan from 'morgan'
 import 'dotenv/config'
 
-import meRouter from '../routes/me'
-import uploadRouter from '../routes/upload'
-import analysisRouter from '../routes/analysis'
-import productsRouter from '../routes/products'
-import dashboardRouter from '../routes/dashboard'
-import customersRouter from '../routes/customers'
-import inventoryRouter from '../routes/inventory'
+import meRouter from '../routes/me.js'
+import uploadRouter from '../routes/upload.js'
+import analysisRouter from '../routes/analysis.js'
+import productsRouter from '../routes/products.js'
+import dashboardRouter from '../routes/dashboard.js'
+import customersRouter from '../routes/customers.js'
+import inventoryRouter from '../routes/inventory.js'
 
 const app = express()
 
