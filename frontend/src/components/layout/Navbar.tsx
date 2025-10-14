@@ -1,38 +1,49 @@
-import React from 'react'
-import { supabase } from '../../lib/supabaseClient'
+import React, { useEffect, useState } from 'react'
 import Button from '../ui/Button'
+import { supabase } from '../../lib/supabaseClient'
+
+type UserInfo = { email?: string | null }
 
 export default function Navbar() {
-  const { session } = useSession()
+  const [user, setUser] = useState<UserInfo | null>(null)
 
-  const handleSignOut = async () => {
+  useEffect(() => {
+    let mounted = true
+
+    // initial load
+    supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) return
+      setUser({ email: data.session?.user?.email ?? null })
+    })
+
+    // subscribe to changes
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return
+      setUser({ email: session?.user?.email ?? null })
+    })
+
+    return () => {
+      mounted = false
+      sub?.subscription?.unsubscribe?.()
+    }
+  }, [])
+
+  const signOut = async () => {
     await supabase.auth.signOut()
+    window.location.href = '/login'
   }
 
   return (
-    <nav className="bg-white border-b border-gray-200 px-6 py-4">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center space-x-4">
-          <h1 className="text-xl font-semibold text-gray-900">
-            Inventory Optimizer
-          </h1>
-        </div>
-        
-        <div className="flex items-center space-x-4">
-          {session?.user?.email && (
-            <span className="text-sm text-gray-600">
-              {session.user.email}
-            </span>
-          )}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={handleSignOut}
-          >
-            Sign out
-          </Button>
+    <header className="sticky top-0 z-40 h-14 w-full border-b bg-white/80 backdrop-blur">
+      <div className="mx-auto max-w-screen-2xl h-full px-4 flex items-center justify-between">
+        <div className="font-semibold text-gray-900">Inventory Optimizer</div>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-gray-600 truncate max-w-[220px]">
+            {user?.email ?? '—'}
+          </span>
+          <Button size="sm" variant="secondary" onClick={signOut}>Logout</Button>
         </div>
       </div>
-    </nav>
+    </header>
   )
 }
