@@ -1,6 +1,6 @@
 // backend/routes/customers.ts
 import { Router } from 'express'
-import { supabaseService } from '../src/supabase'
+import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
