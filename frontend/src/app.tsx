@@ -1,5 +1,5 @@
 import { Navigate } from 'react-router-dom'
-import { useSession } from './lib/SessionProvider'
+import { useSession } from './lib/SessionProvider.tsx'
 import AppShell from './components/layout/AppShell'
 import React from 'react'
 
