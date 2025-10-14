@@ -6,26 +6,27 @@ import { supabaseService } from '../src/supabase.js'
 const router = Router()
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 30 * 1024 * 1024 } // 30MB for big sheets
+  limits: { fileSize: 30 * 1024 * 1024 } // 30MB
 })
 
 /** ───────────────────────── Helpers ───────────────────────── **/
 
 // Normalize for case-insensitive lookups
 const norm = (s: any) =>
-  String(s ?? '')
+  globalThis.String(s ?? '')
     .replace(/^\uFEFF/, '') // strip BOM
     .trim()
     .toLowerCase()
     .replace(/\s+/g, ' ')
 
 // Remove leading "[...]" code, then trim.
-const stripLeadingTag = (s: string) => String(s ?? '').replace(/^\s*\[[^\]]+\]\s*/,'').trim()
+const stripLeadingTag = (s: string) =>
+  globalThis.String(s ?? '').replace(/^\s*\[[^\]]+\]\s*/,'').trim()
 
 // Number parser tolerant to "1,234", "1 234", "1.234,56", etc.
 function parseNumber(input: any): number | null {
   if (input === null || input === undefined) return null
-  let s = String(input).trim()
+  let s = globalThis.String(input).trim()
   if (!s) return null
   // If comma is decimal sep (e.g., "1.234,56")
   if (/,/.test(s) && !/\.\d+$/.test(s) && /,\d+$/.test(s)) {
@@ -80,11 +81,11 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     let aoa: any[][]
     try {
       aoa = sheetToAOA(req.file.buffer)
-    } catch (e: any) {
+    } catch {
       return res.status(400).json({ error: 'Unable to parse file. Use .xlsx/.xls/.csv with headers.' })
     }
 
-    const headerRow = (aoa[0] ?? []).map(h => String(h ?? ''))
+    const headerRow = (aoa[0] ?? []).map(h => globalThis.String(h ?? ''))
     if (!headerRow.length) return res.status(400).json({ error: 'Header row missing' })
 
     const idxMap: Record<typeof REQUIRED[number], number> = {
@@ -114,7 +115,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     // Body rows (non-empty)
     const rows = aoa
       .slice(1)
-      .filter(r => r && r.some((c: any) => c !== null && c !== undefined && String(c).trim() !== ''))
+      .filter(r => r && r.some((c: any) => c !== null && c !== undefined && globalThis.String(c).trim() !== ''))
 
     if (!rows.length) {
       return res.status(400).json({ error: 'No data rows found' })
@@ -131,7 +132,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     // Parse + validate
     rows.forEach((r, i) => {
       const rowNum = i + 2
-      const name = String(r[idxMap['name']] ?? '').trim()
+      const name = globalThis.String(r[idxMap['name']] ?? '').trim()
       const price = parseNumber(r[idxMap['sales price (current)']])
       const cost  = parseNumber(r[idxMap['cost']])
       const onH   = parseNumber(r[idxMap['quantity on hand (stocks)']])
@@ -168,8 +169,8 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const strippedMap = new Map<string, string>() // normalized stripped name → id
 
     for (const p of (allProds.data ?? [])) {
-      const id = String(p.id)
-      const name = String(p.name ?? '')
+      const id = globalThis.String(p.id)
+      const name = globalThis.String(p.name ?? '')
       const exactKey = norm(name)
       const strippedKey = norm(stripLeadingTag(name))
       if (exactKey && !exactMap.has(exactKey)) exactMap.set(exactKey, id)
@@ -181,7 +182,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const resolved: Resolved[] = []
 
     for (const r of clean) {
-      const incoming = String(r.name)
+      const incoming = globalThis.String(r.name)
       const exactKey = norm(incoming)
       const strippedKey = norm(stripLeadingTag(incoming))
 
@@ -194,14 +195,12 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
       if (product_id) {
         // stash display name if we have it (find once)
-        const found = (allProds.data ?? []).find(p => String(p.id) === product_id)
-        matched_name = String(found?.name ?? incoming)
+        const found = (allProds.data ?? []).find(p => globalThis.String(p.id) === product_id)
+        matched_name = globalThis.String(found?.name ?? incoming)
       }
 
       if (!product_id) {
-        // No duplicate creation here (to avoid new “duplicate” products);
-        // if you want to create new products for unmatched names, do it here.
-        // For now, reject cleanly.
+        // No auto-create to avoid duplicates; count as rejected
         rejected.push({ row: -1, reason: `No matching product for "${incoming}"` })
         reasonCounts.set('No matching product', (reasonCounts.get('No matching product') || 0) + 1)
         continue
@@ -240,7 +239,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const invPayload:   InvRow[]   = []
 
     for (const r of resolved) {
-      const pid = String(r.product_id)
+      const pid = globalThis.String(r.product_id)
       pricePayload.push({
         product_id: pid,
         effective_date: todayISO,
@@ -256,8 +255,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Insert in chunks; tolerate duplicates by onConflict when applicable.
-    // Adjust onConflict to your schema’s unique keys.
+    // Insert in chunks; onConflict ensures one row per day per product
     let priceInserted = 0
     for (const part of chunk(pricePayload, 500)) {
       const ins = await supabaseService
