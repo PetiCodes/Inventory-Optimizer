@@ -1,6 +1,6 @@
 // backend/src/routes/me.ts
 import { Router } from 'express'
-import { requireAuth } from '../src/authMiddleware' // we'll fix this import below if needed
+import { requireAuth } from '../src/authMiddleware.js' // we'll fix this import below if needed
 
 const router = Router()
 
