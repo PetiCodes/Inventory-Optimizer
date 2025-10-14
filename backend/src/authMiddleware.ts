@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from 'express'
-import { supabaseService } from './supabase'
+import { supabaseService } from './supabase.js'
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
   try {
