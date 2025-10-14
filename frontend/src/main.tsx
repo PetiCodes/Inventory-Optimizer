@@ -4,7 +4,6 @@ import { createBrowserRouter, RouterProvider } from 'react-router-dom'
 import App from './app'
 import Login from './routes/Login'
 import Dashboard from './routes/Dashboard'
-import { SessionProvider } from './lib/SessionProvider'
 import { ToastProvider } from './components/ToastProvider'
 import './index.css'
 import DataUpload from './routes/DataUpload'
@@ -83,10 +82,8 @@ const router = createBrowserRouter([
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <SessionProvider>
       <ToastProvider>
         <RouterProvider router={router} />
       </ToastProvider>
-    </SessionProvider>
   </React.StrictMode>
 )
