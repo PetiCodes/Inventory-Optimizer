@@ -1,7 +1,7 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { createBrowserRouter, RouterProvider } from 'react-router-dom'
-import App from './App'
+import App from './app'
 import Login from './routes/Login'
 import Dashboard from './routes/Dashboard'
 import { SessionProvider, useSession } from './lib/sessionProvider'
