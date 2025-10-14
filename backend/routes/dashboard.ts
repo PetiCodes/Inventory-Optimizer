@@ -156,21 +156,21 @@ router.get('/dashboard/overview', async (_req, res) => {
       if (gap > 0) {
         atRisk.push({
           product_id: pid,
-          product_name: nameMap.get(pid) || 'Unknown',
+          product_name: nameMap.get(pid) ?? 'Unknown',
           on_hand: inv.on_hand,
           weighted_moq,
           gap,
           last_sale_date
         })
-      }
 
-      top.push({
-        product_id: pid,
-        product_name: nameMap.get(pid) || 'Unknown',
-        qty_12m,
-        revenue_12m,
-        gross_profit_12m
-      })
+        top.push({
+          product_id: pid,
+          product_name: nameMap.get(pid) ?? 'Unknown',
+          qty_12m,
+          revenue_12m,
+          gross_profit_12m
+        })
+
     }
 
     // Sort at-risk by largest gap, top by qty descending
