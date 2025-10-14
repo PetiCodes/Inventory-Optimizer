@@ -4,7 +4,7 @@
     "module": "ES2020",
     "moduleResolution": "Bundler",
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": ".",
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
@@ -13,6 +13,7 @@
     "noImplicitAny": false,
     "types": ["node"]
   },
-  "include": ["src", "routes"]
+  "include": ["src/**/*.ts", "routes/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
 }
   
