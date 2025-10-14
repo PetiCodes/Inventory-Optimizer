@@ -1,30 +1,36 @@
-import React, { createContext, useContext, useEffect, useState } from 'react'
-import type { Session } from '@supabase/supabase-js'
+import React, { createContext, useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 
-type Ctx = { session: Session | null; loading: boolean }
-const SessionCtx = createContext<Ctx>({ session: null, loading: true })
+type Session = NonNullable<Awaited<ReturnType<typeof supabase.auth.getSession>>['data']['session']> | null
+type Ctx = { session: Session }
 
-export function SessionProvider({ children }: { children: React.ReactNode }) {
-  const [session, setSession] = useState<Session | null>(null)
-  const [loading, setLoading] = useState(true)
+export const SessionContext = createContext<Ctx>({ session: null })
+
+const SessionProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
+  const [session, setSession] = useState<Session>(null)
 
   useEffect(() => {
+    let mounted = true
+
     supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session ?? null)
-      setLoading(false)
+      if (mounted) setSession(data.session ?? null)
     })
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
-      setSession(s)
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      if (mounted) setSession(newSession ?? null)
     })
-    return () => sub.subscription.unsubscribe()
+
+    return () => {
+      mounted = false
+      sub?.subscription?.unsubscribe?.()
+    }
   }, [])
 
   return (
-    <SessionCtx.Provider value={{ session, loading }}>
+    <SessionContext.Provider value={{ session }}>
       {children}
-    </SessionCtx.Provider>
+    </SessionContext.Provider>
   )
 }
 
-export const useSession = () => useContext(SessionCtx)
+export default SessionProvider
