@@ -9,14 +9,12 @@ export default function App() {
   useEffect(() => {
     let mounted = true
 
-    // initial session fetch
     supabase.auth.getSession().then(({ data }) => {
       if (!mounted) return
       setSession(data.session ?? null)
       setLoading(false)
     })
 
-    // subscribe to auth changes
     const { data: sub } = supabase.auth.onAuthStateChange((_event, newSession) => {
       if (!mounted) return
       setSession(newSession ?? null)
@@ -28,8 +26,7 @@ export default function App() {
     }
   }, [])
 
-  if (loading) return null // or a small loader
-
+  if (loading) return null
   if (session) return <Navigate to="/dashboard" replace />
   return <Navigate to="/login" replace />
 }
