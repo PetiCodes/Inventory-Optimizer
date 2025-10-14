@@ -1,12 +1,15 @@
-import React, { createContext, useEffect, useState } from 'react'
+import React, { createContext, useContext, useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 
 type Session = NonNullable<Awaited<ReturnType<typeof supabase.auth.getSession>>['data']['session']> | null
-type Ctx = { session: Session }
 
-export const SessionContext = createContext<Ctx>({ session: null })
+interface SessionContextType {
+  session: Session
+}
 
-const SessionProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
+const SessionContext = createContext<SessionContextType>({ session: null })
+
+export const SessionProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
   const [session, setSession] = useState<Session>(null)
 
   useEffect(() => {
@@ -31,6 +34,10 @@ const SessionProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
       {children}
     </SessionContext.Provider>
   )
+}
+
+export function useSession() {
+  return useContext(SessionContext)
 }
 
 export default SessionProvider
