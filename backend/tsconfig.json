@@ -1,19 +1,20 @@
 {
   "compilerOptions": {
     "target": "ES2020",
-    "module": "ES2020",
-    "moduleResolution": "Bundler",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
     "outDir": "dist",
     "rootDir": ".",
+
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
-
-    // add or change these:
     "noImplicitAny": false,
     "types": ["node"]
   },
   "include": ["src/**/*.ts", "routes/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }
+
   
