@@ -142,13 +142,6 @@ router.get('/dashboard/overview', async (_req, res) => {
       const inv = invMap.get(pid) || { on_hand: 0, backorder: 0 }
       const gap = weighted_moq - inv.on_hand
 
-      // last sale date
-      let last_sale_date: string | null = null
-      for (const r of rows) {
-        const d = String(r.date)
-        if (!last_sale_date || d > last_sale_date) last_sale_date = d
-      }
-
       // top metrics
       const cost = costMap.get(pid)?.cost ?? 0
       const qty_12m = rows.reduce((s, r) => s + Number(r.quantity || 0), 0)
