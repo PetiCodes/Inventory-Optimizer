@@ -1,3 +1,4 @@
+// backend/routes/inventory.ts
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
@@ -11,7 +12,7 @@ const upload = multer({
 
 /** ───────────────────────── Helpers ───────────────────────── **/
 
-// Safe string coercion (never call String())
+// Safe string coercion (never call global String())
 const s = (v: any) => `${v ?? ''}`
 
 // Normalize for case-insensitive lookups
@@ -87,7 +88,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Unable to parse file. Use .xlsx/.xls/.csv with headers.' })
     }
 
-    const headerRow = (aoa[0] ?? []).map(h => s(h))
+    const headerRow = (aoa[0] ?? []).map((h: any) => s(h))
     if (!headerRow.length) return res.status(400).json({ error: 'Header row missing' })
 
     const idxMap: Record<typeof REQUIRED[number], number> = {
@@ -97,9 +98,9 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       'quantity on hand (stocks)': -1
     }
 
-    headerRow.forEach((h, i) => {
+    headerRow.forEach((h: any, i: number) => {
       const nh = norm(h)
-      (REQUIRED as readonly string[]).forEach(reqH => {
+      ;(REQUIRED as readonly string[]).forEach(reqH => {
         if (idxMap[reqH as typeof REQUIRED[number]] === -1 && nh === reqH) {
           idxMap[reqH as typeof REQUIRED[number]] = i
         }
@@ -117,7 +118,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     // Body rows (non-empty)
     const rows = aoa
       .slice(1)
-      .filter(r => r && r.some((c: any) => c !== null && c !== undefined && s(c).trim() !== ''))
+      .filter((r: any[]) => r && r.some((c: any) => c !== null && c !== undefined && s(c).trim() !== ''))
 
     if (!rows.length) {
       return res.status(400).json({ error: 'No data rows found' })
@@ -132,7 +133,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     }
 
     // Parse + validate
-    rows.forEach((r, i) => {
+    rows.forEach((r: any[], i: number) => {
       const rowNum = i + 2
       const name = s(r[idxMap['name']]).trim()
       const price = parseNumber(r[idxMap['sales price (current)']])
@@ -172,9 +173,9 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     for (const p of (allProds.data ?? [])) {
       const id = s(p.id)
-      const name = s(p.name)
-      const exactKey = norm(name)
-      const strippedKey = norm(stripLeadingTag(name))
+      const pname = s(p.name)
+      const exactKey = norm(pname)
+      const strippedKey = norm(stripLeadingTag(pname))
       if (exactKey && !exactMap.has(exactKey)) exactMap.set(exactKey, id)
       if (strippedKey && !strippedMap.has(strippedKey)) strippedMap.set(strippedKey, id)
     }
@@ -197,12 +198,11 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
       if (product_id) {
         // stash display name if we have it (find once)
-        const found = (allProds.data ?? []).find(p => s(p.id) === product_id)
+        const found = (allProds.data ?? []).find((p: any) => s(p.id) === product_id)
         matched_name = s(found?.name ?? incoming)
       }
 
       if (!product_id) {
-        // No auto-create to avoid duplicates; count as rejected
         reject(-1, `No matching product for "${incoming}"`)
         continue
       }
