@@ -54,18 +54,27 @@ export default function Products() {
         <div className="flex flex-col md:flex-row md:items-center gap-3">
           <h1 className="text-2xl font-bold text-gray-900">Products</h1>
           <div className="md:ml-auto w-full md:w-[420px]">
-            <Input label="Search product" placeholder="Type product name…" value={typing} onChange={e => setTyping(e.target.value)} />
+            <Input
+              label="Search product"
+              placeholder="Type product name…"
+              value={typing}
+              onChange={e => setTyping(e.target.value)}
+            />
           </div>
         </div>
 
         <Card>
           <CardHeader>
-            <div className="text-sm text-gray-600">{loading ? 'Searching…' : `Found ${items.length} items`}</div>
+            <div className="text-sm text-gray-600">
+              {loading ? 'Searching…' : `Found ${items.length} items`}
+            </div>
           </CardHeader>
           <CardContent>
             {error && <Alert variant="error">{error}</Alert>}
             {loading ? (
-              <div className="flex items-center gap-2 text-gray-600"><Spinner size="sm" /> Loading…</div>
+              <div className="flex items-center gap-2 text-gray-600">
+                <Spinner size="sm" /> Loading…
+              </div>
             ) : (
               <Table>
                 <TableHeader>
@@ -81,15 +90,19 @@ export default function Products() {
                       <TableCell>{i + 1}</TableCell>
                       <TableCell className="font-medium">{p.name}</TableCell>
                       <TableCell className="text-right">
-                        <Button size="sm" onClick={() => navigate(`/products/${p.id}`)}>View</Button>
+                        <Button size="sm" onClick={() => navigate(`/products/${p.id}`)}>
+                          View
+                        </Button>
                       </TableCell>
                     </TableRow>
                   ))}
-                  {(items ?? []).length === 0 && !loading && !error && (
+                  {((items ?? []).length === 0 && !loading && !error) && (
                     <TableRow>
-                      <TableCell colSpan={3} className="text-center text-gray-500">No products found.</TableCell>
+                      <TableCell colSpan={3} className="text-center text-gray-500">
+                        No products found.
+                      </TableCell>
                     </TableRow>
-                  ))}
+                  )}
                 </TableBody>
               </Table>
             )}
