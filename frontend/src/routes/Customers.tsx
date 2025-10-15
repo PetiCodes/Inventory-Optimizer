@@ -25,6 +25,7 @@ export default function Customers() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // debounce search input
   useEffect(() => {
     const t = setTimeout(() => {
       setQ(typing.trim())
@@ -60,7 +61,9 @@ export default function Customers() {
     }
   }
 
-  useEffect(() => { load() }, [page, q])
+  useEffect(() => {
+    load()
+  }, [page, q])
 
   const totalPages = useMemo(() => Math.max(1, Math.ceil(total / pageSize)), [total])
   const canPrev = page > 1
@@ -88,16 +91,35 @@ export default function Customers() {
                 {loading ? 'Loading…' : `Showing ${items.length} of ${total} customers`}
               </div>
               <div className="flex items-center gap-2">
-                <Button variant="secondary" size="sm" disabled={!canPrev || loading} onClick={() => setPage(p => Math.max(1, p - 1))}>← Prev</Button>
-                <span className="text-sm text-gray-700">Page {page} / {totalPages}</span>
-                <Button variant="secondary" size="sm" disabled={!canNext || loading} onClick={() => setPage(p => Math.min(totalPages, p + 1))}>Next →</Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={!canPrev || loading}
+                  onClick={() => setPage(p => Math.max(1, p - 1))}
+                >
+                  ← Prev
+                </Button>
+                <span className="text-sm text-gray-700">
+                  Page {page} / {totalPages}
+                </span>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={!canNext || loading}
+                  onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                >
+                  Next →
+                </Button>
               </div>
             </div>
           </CardHeader>
+
           <CardContent>
             {error && <Alert variant="error">{error}</Alert>}
             {loading ? (
-              <div className="flex items-center gap-2 text-gray-600"><Spinner size="sm" /> Loading…</div>
+              <div className="flex items-center gap-2 text-gray-600">
+                <Spinner size="sm" /> Loading…
+              </div>
             ) : (
               <Table>
                 <TableHeader>
@@ -113,15 +135,23 @@ export default function Customers() {
                       <TableCell>{(page - 1) * pageSize + i + 1}</TableCell>
                       <TableCell className="font-medium">{c.name}</TableCell>
                       <TableCell className="text-right">
-                        <Button size="sm" onClick={() => navigate(`/customers/${c.id}`)}>View</Button>
+                        <Button
+                          size="sm"
+                          onClick={() => navigate(`/customers/${c.id}`)}
+                        >
+                          View
+                        </Button>
                       </TableCell>
                     </TableRow>
                   ))}
+
                   {(items ?? []).length === 0 && !loading && !error && (
                     <TableRow>
-                      <TableCell colSpan={3} className="text-center text-gray-500">No customers found.</TableCell>
+                      <TableCell colSpan={3} className="text-center text-gray-500">
+                        No customers found.
+                      </TableCell>
                     </TableRow>
-                  ))}
+                  )}
                 </TableBody>
               </Table>
             )}
