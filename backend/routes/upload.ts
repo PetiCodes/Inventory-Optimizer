@@ -9,7 +9,7 @@ const router = Router()
 // 15 MB limit is usually plenty for Excel; adjust if needed
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 }
+  limits: { fileSize: 30 * 1024 * 1024 }
 })
 
 // ─────────────────────────── Helpers ───────────────────────────
