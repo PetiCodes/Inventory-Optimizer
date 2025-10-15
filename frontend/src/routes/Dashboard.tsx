@@ -121,7 +121,9 @@ export default function Dashboard() {
                           <TableCell className="text-right">{fmt.format(r.weighted_moq)}</TableCell>
                           <TableCell className="text-right text-red-600 font-medium">{fmt.format(r.gap)}</TableCell>
                           <TableCell className="text-right">
-                            <Button size="sm" variant="secondary" onClick={() => navigate(`/products/${r.product_id}`)}>View</Button>
+                            <Button size="sm" variant="secondary" onClick={() => navigate(`/products/${r.product_id}`)}>
+                              View
+                            </Button>
                           </TableCell>
                         </TableRow>
                       ))}
@@ -137,7 +139,9 @@ export default function Dashboard() {
             </Card>
 
             <Card>
-              <CardHeader><h3 className="text-lg font-semibold text-gray-900">Top Products (last 12 months)</h3></CardHeader>
+              <CardHeader>
+                <h3 className="text-lg font-semibold text-gray-900">Top Products (last 12 months)</h3>
+              </CardHeader>
               <CardContent>
                 <div className="overflow-x-auto">
                   <Table>
@@ -160,7 +164,9 @@ export default function Dashboard() {
                           <TableCell className="text-right">₹ {money(p.revenue_12m)}</TableCell>
                           <TableCell className="text-right">₹ {money(p.gross_profit_12m)}</TableCell>
                           <TableCell className="text-right">
-                            <Button size="sm" variant="secondary" onClick={() => navigate(`/products/${p.product_id}`)}>View</Button>
+                            <Button size="sm" variant="secondary" onClick={() => navigate(`/products/${p.product_id}`)}>
+                              View
+                            </Button>
                           </TableCell>
                         </TableRow>
                       ))}
