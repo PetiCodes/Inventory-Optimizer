@@ -47,22 +47,26 @@ export default function DataUpload() {
           const lines = text.split(/\r?\n/).filter(Boolean)
           if (!lines.length) return
           const headers = lines[0].split(',').map(h => h.trim())
-          const valid = REQUIRED_HEADERS.length <= headers.length &&
-            REQUIRED_HEADERS.every((h) => headers.includes(h))
+          const valid =
+            REQUIRED_HEADERS.length <= headers.length &&
+            REQUIRED_HEADERS.every(h => headers.includes(h))
           if (!valid) {
             setErrors(['Invalid headers. Expected: Date, Customer Name, Product, Quantity (Price optional)'])
             return
           }
-          const parsed = lines.slice(1).slice(0, 20).map(line => {
-            const cells = line.split(',')
-            return {
-              Date: cells[0],
-              'Customer Name': cells[1],
-              Product: cells[2],
-              Quantity: cells[3],
-              Price: cells[4]
-            } as PreviewRow
-          })
+          const parsed = lines
+            .slice(1)
+            .slice(0, 20)
+            .map(line => {
+              const cells = line.split(',')
+              return {
+                Date: cells[0],
+                'Customer Name': cells[1],
+                Product: cells[2],
+                Quantity: cells[3],
+                Price: cells[4]
+              } as PreviewRow
+            })
           setRows(parsed)
         } catch {
           setErrors(['Failed to read CSV preview'])
@@ -75,7 +79,10 @@ export default function DataUpload() {
   }
 
   async function onUpload() {
-    if (!file) { addToast('Please choose a file', 'warning'); return }
+    if (!file) {
+      addToast('Please choose a file', 'warning')
+      return
+    }
     setUploading(true)
     setSummary(null)
     try {
@@ -110,13 +117,15 @@ export default function DataUpload() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Data Upload</h1>
           <p className="text-gray-600">
-            Upload Excel/CSV with headers:&nbsp;
-            <code>Date, Customer Name, Product, Quantity</code> (<em>Price optional</em>)
+            Upload Excel/CSV with headers: <code>Date, Customer Name, Product, Quantity</code>{' '}
+            (<em>Price optional</em>)
           </p>
         </div>
 
         <Card>
-          <CardHeader><h3 className="text-lg font-semibold text-gray-900">Upload File</h3></CardHeader>
+          <CardHeader>
+            <h3 className="text-lg font-semibold text-gray-900">Upload File</h3>
+          </CardHeader>
           <CardContent className="space-y-4">
             <input
               type="file"
@@ -124,17 +133,29 @@ export default function DataUpload() {
               onChange={onFileChange}
               className="block w-full text-sm text-gray-700 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-primary-50 file:text-primary-700 hover:file:bg-primary-100"
             />
-            {errors.length > 0 && (<Alert variant="error">{errors.map((e, i) => <div key={i}>{e}</div>)}</Alert>)}
-            {file && file.name.match(/\.(xlsx|xls)$/i) && (<Alert variant="info">Preview for .xlsx is not shown here; server will validate and parse.</Alert>)}
+            {errors.length > 0 && (
+              <Alert variant="error">
+                {errors.map((e, i) => (
+                  <div key={i}>{e}</div>
+                ))}
+              </Alert>
+            )}
+            {file && file.name.match(/\.(xlsx|xls)$/i) && (
+              <Alert variant="info">Preview for .xlsx is not shown here; server will validate and parse.</Alert>
+            )}
           </CardContent>
           <CardFooter className="flex justify-end">
-            <Button onClick={onUpload} disabled={uploading || !file}>{uploading ? 'Uploading…' : 'Upload'}</Button>
+            <Button onClick={onUpload} disabled={uploading || !file}>
+              {uploading ? 'Uploading…' : 'Upload'}
+            </Button>
           </CardFooter>
         </Card>
 
         {rows.length > 0 && (
           <Card>
-            <CardHeader><h3 className="text-lg font-semibold text-gray-900">Preview (first 20 rows)</h3></CardHeader>
+            <CardHeader>
+              <h3 className="text-lg font-semibold text-gray-900">Preview (first 20 rows)</h3>
+            </CardHeader>
             <CardContent>
               <Table>
                 <TableHeader>
@@ -166,7 +187,11 @@ export default function DataUpload() {
           <Alert variant="warning">
             <div className="font-semibold mb-2">Rejected rows breakdown</div>
             <ul className="list-disc ml-6 space-y-1">
-              {Object.entries(summary.reasonCounts).map(([k, v]) => (<li key={k}>{k}: {v as number}</li>))}
+              {Object.entries(summary.reasonCounts).map(([k, v]) => (
+                <li key={k}>
+                  {k}: {v as number}
+                </li>
+              ))}
             </ul>
             {summary.sampleRejected?.length > 0 && (
               <div className="mt-2 text-sm text-gray-700">
