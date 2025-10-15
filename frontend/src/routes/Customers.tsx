@@ -1,4 +1,3 @@
-// frontend/src/routes/Customers.tsx
 import React, { useEffect, useMemo, useState } from 'react'
 import AppShell from '../components/layout/AppShell'
 import Card, { CardHeader, CardContent } from '../components/ui/Card'
@@ -8,7 +7,7 @@ import Input from '../components/ui/Input'
 import Spinner from '../components/ui/Spinner'
 import Alert from '../components/ui/Alert'
 import { useNavigate } from 'react-router-dom'
-
+import { supabase } from '../lib/supabaseClient'
 
 type Customer = { id: string; name: string }
 type ApiList = { items: Customer[]; total: number; page: number; pageSize: number }
@@ -16,23 +15,20 @@ type ApiList = { items: Customer[]; total: number; page: number; pageSize: numbe
 export default function Customers() {
   const navigate = useNavigate()
 
-  // UI state
   const [page, setPage] = useState(1)
   const pageSize = 15
   const [q, setQ] = useState('')
-  const [typing, setTyping] = useState('') // for debounced search box
+  const [typing, setTyping] = useState('')
 
-  // data state
   const [items, setItems] = useState<Customer[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Debounce search input (300ms)
   useEffect(() => {
     const t = setTimeout(() => {
       setQ(typing.trim())
-      setPage(1) // reset to first page when searching
+      setPage(1)
     }, 300)
     return () => clearTimeout(t)
   }, [typing])
@@ -46,11 +42,13 @@ export default function Customers() {
       params.set('pageSize', String(pageSize))
       if (q) params.set('q', q)
 
-      const res = await fetch(`${(import.meta as any).env.VITE_API_BASE}/api/customers?` + params.toString())
+      const token = (await supabase.auth.getSession()).data.session?.access_token
+      const res = await fetch(`${(import.meta as any).env.VITE_API_BASE}/api/customers?` + params.toString(), {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      })
       const json: Partial<ApiList> = await res.json()
       if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`)
 
-      // defensive defaults to avoid .map on undefined
       setItems(Array.isArray(json.items) ? json.items : [])
       setTotal(typeof json.total === 'number' ? json.total : 0)
     } catch (e: any) {
@@ -65,7 +63,6 @@ export default function Customers() {
   useEffect(() => { load() }, [page, q])
 
   const totalPages = useMemo(() => Math.max(1, Math.ceil(total / pageSize)), [total])
-
   const canPrev = page > 1
   const canNext = page < totalPages
 
@@ -91,25 +88,9 @@ export default function Customers() {
                 {loading ? 'Loading…' : `Showing ${items.length} of ${total} customers`}
               </div>
               <div className="flex items-center gap-2">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  disabled={!canPrev || loading}
-                  onClick={() => setPage(p => Math.max(1, p - 1))}
-                >
-                  ← Prev
-                </Button>
-                <span className="text-sm text-gray-700">
-                  Page {page} / {totalPages}
-                </span>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  disabled={!canNext || loading}
-                  onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                >
-                  Next →
-                </Button>
+                <Button variant="secondary" size="sm" disabled={!canPrev || loading} onClick={() => setPage(p => Math.max(1, p - 1))}>← Prev</Button>
+                <span className="text-sm text-gray-700">Page {page} / {totalPages}</span>
+                <Button variant="secondary" size="sm" disabled={!canNext || loading} onClick={() => setPage(p => Math.min(totalPages, p + 1))}>Next →</Button>
               </div>
             </div>
           </CardHeader>
@@ -132,9 +113,7 @@ export default function Customers() {
                       <TableCell>{(page - 1) * pageSize + i + 1}</TableCell>
                       <TableCell className="font-medium">{c.name}</TableCell>
                       <TableCell className="text-right">
-                        <Button size="sm" onClick={() => navigate(`/customers/${c.id}`)}>
-                          View
-                        </Button>
+                        <Button size="sm" onClick={() => navigate(`/customers/${c.id}`)}>View</Button>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -142,7 +121,7 @@ export default function Customers() {
                     <TableRow>
                       <TableCell colSpan={3} className="text-center text-gray-500">No customers found.</TableCell>
                     </TableRow>
-                  )}
+                  ))}
                 </TableBody>
               </Table>
             )}
