@@ -52,13 +52,20 @@ export default function ProductDetail() {
 
   const fmt = new Intl.NumberFormat()
   const money = (v: number) => v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  const series = useMemo(() => (data?.monthly ?? []).map(m => ({ ...m, label: m.month.slice(0, 7) })), [data?.monthly])
+  const series = useMemo(
+    () => (data?.monthly ?? []).map(m => ({ ...m, label: m.month.slice(0, 7) })),
+    [data?.monthly]
+  )
 
   return (
     <AppShell>
       <div className="space-y-6">
         {err && <Alert variant="error">{err}</Alert>}
-        {loading && (<div className="flex items-center gap-2 text-gray-600"><Spinner size="sm" /> Loading…</div>)}
+        {loading && (
+          <div className="flex items-center gap-2 text-gray-600">
+            <Spinner size="sm" /> Loading…
+          </div>
+        )}
 
         {!loading && !err && data && (
           <>
@@ -70,7 +77,14 @@ export default function ProductDetail() {
               <div className="md:ml-auto flex items-center gap-2">
                 <span className="text-sm text-gray-700">Months:</span>
                 {[12, 24, 36, 48].map(m => (
-                  <Button key={m} size="sm" variant={m === months ? 'primary' : 'secondary'} onClick={() => setMonths(m)}>{m}</Button>
+                  <Button
+                    key={m}
+                    size="sm"
+                    variant={m === months ? 'primary' : 'secondary'}
+                    onClick={() => setMonths(m)}
+                  >
+                    {m}
+                  </Button>
                 ))}
               </div>
             </div>
@@ -119,8 +133,10 @@ export default function ProductDetail() {
                         <TableCell className="text-right">{fmt.format(c.qty)}</TableCell>
                       </TableRow>
                     ))}
-                    {(data.topCustomers ?? []).length === 0 && (
-                      <TableRow><TableCell colSpan={3} className="text-center text-gray-500">No customers.</TableCell></TableRow>
+                    {((data.topCustomers ?? []).length === 0) && (
+                      <TableRow>
+                        <TableCell colSpan={3} className="text-center text-gray-500">No customers.</TableCell>
+                      </TableRow>
                     )}
                   </TableBody>
                 </Table>
