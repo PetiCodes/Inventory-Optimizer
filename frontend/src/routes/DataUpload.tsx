@@ -4,56 +4,79 @@ import Card, { CardContent, CardHeader, CardFooter } from '../components/ui/Card
 import Table, { TableHeader, TableRow, TableHead, TableBody, TableCell } from '../components/ui/Table'
 import Button from '../components/ui/Button'
 import Alert from '../components/ui/Alert'
+import Spinner from '../components/ui/Spinner'
 import { useToast } from '../components/ToastProvider'
 import { supabase } from '../lib/supabaseClient'
 
-type PreviewRow = {
+/** ---------- Sales (CSV preview) ---------- */
+type SalesPreviewRow = {
   Date: string
   'Customer Name': string
   Product: string
   Quantity: string | number
   Price?: string | number
 }
-
-const REQUIRED_HEADERS = ['Date', 'Customer Name', 'Product', 'Quantity'] as const
+const SALES_REQUIRED_HEADERS = ['Date', 'Customer Name', 'Product', 'Quantity', 'Price'] as const
 
 export default function DataUpload() {
-  const [file, setFile] = useState<File | null>(null)
-  const [rows, setRows] = useState<PreviewRow[]>([])
-  const [errors, setErrors] = useState<string[]>([])
-  const [summary, setSummary] = useState<any | null>(null)
-  const [uploading, setUploading] = useState(false)
   const { addToast } = useToast()
 
-  function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+  // Sales upload state
+  const [salesFile, setSalesFile] = useState<File | null>(null)
+  const [salesRows, setSalesRows] = useState<SalesPreviewRow[]>([])
+  const [salesErrors, setSalesErrors] = useState<string[]>([])
+  const [salesUploading, setSalesUploading] = useState(false)
+  const [salesSummary, setSalesSummary] = useState<any | null>(null)
+
+  // Inventory upload state
+  const [invFile, setInvFile] = useState<File | null>(null)
+  const [invUploading, setInvUploading] = useState(false)
+  const [invErrors, setInvErrors] = useState<string[]>([])
+  const [invSummary, setInvSummary] = useState<any | null>(null)
+
+  /** ----------------- Helpers ----------------- */
+  function isCSV(name: string) {
+    return /\.csv$/i.test(name)
+  }
+  function isExcel(name: string) {
+    return /\.(xlsx|xls)$/i.test(name)
+  }
+
+  /** ----------------- Sales: onFileChange (with CSV preview) ----------------- */
+  function onSalesFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0] || null
-    setFile(f)
-    setRows([])
-    setErrors([])
-    setSummary(null)
+    setSalesFile(f)
+    setSalesRows([])
+    setSalesErrors([])
+    setSalesSummary(null)
     if (!f) return
 
     const name = f.name.toLowerCase()
-    if (!name.endsWith('.xlsx') && !name.endsWith('.xls') && !name.endsWith('.csv')) {
-      setErrors(['Unsupported file type. Use .xlsx, .xls, or .csv'])
+    if (!isCSV(name) && !isExcel(name)) {
+      setSalesErrors(['Unsupported file type. Use .xlsx, .xls, or .csv'])
       return
     }
 
-    if (name.endsWith('.csv')) {
+    if (isCSV(name)) {
       const reader = new FileReader()
       reader.onload = () => {
         try {
           const text = String(reader.result || '')
           const lines = text.split(/\r?\n/).filter(Boolean)
           if (!lines.length) return
+
           const headers = lines[0].split(',').map(h => h.trim())
           const valid =
-            REQUIRED_HEADERS.length <= headers.length &&
-            REQUIRED_HEADERS.every(h => headers.includes(h))
+            SALES_REQUIRED_HEADERS.length === headers.length &&
+            SALES_REQUIRED_HEADERS.every((h, i) => headers[i] === h)
+
           if (!valid) {
-            setErrors(['Invalid headers. Expected: Date, Customer Name, Product, Quantity (Price optional)'])
+            setSalesErrors([
+              'Invalid headers. Expected: Date, Customer Name, Product, Quantity, Price',
+            ])
             return
           }
+
           const parsed = lines
             .slice(1)
             .slice(0, 20)
@@ -64,142 +87,273 @@ export default function DataUpload() {
                 'Customer Name': cells[1],
                 Product: cells[2],
                 Quantity: cells[3],
-                Price: cells[4]
-              } as PreviewRow
+                Price: cells[4],
+              } as SalesPreviewRow
             })
-          setRows(parsed)
+
+          setSalesRows(parsed)
         } catch {
-          setErrors(['Failed to read CSV preview'])
+          setSalesErrors(['Failed to read CSV preview'])
         }
       }
       reader.readAsText(f)
     } else {
-      setRows([])
+      // xlsx/xls — let backend validate & parse
+      setSalesRows([])
     }
   }
 
-  async function onUpload() {
-    if (!file) {
-      addToast('Please choose a file', 'warning')
+  /** ----------------- Inventory: onFileChange ----------------- */
+  function onInventoryFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0] || null
+    setInvFile(f)
+    setInvErrors([])
+    setInvSummary(null)
+    if (!f) return
+
+    const name = f.name.toLowerCase()
+    if (!isCSV(name) && !isExcel(name)) {
+      setInvErrors(['Unsupported file type. Use .xlsx, .xls, or .csv'])
       return
     }
-    setUploading(true)
-    setSummary(null)
+  }
+
+  /** ----------------- Upload Sales ----------------- */
+  async function uploadSales() {
+    if (!salesFile) {
+      addToast('Please choose a sales file', 'warning')
+      return
+    }
+    setSalesUploading(true)
+    setSalesSummary(null)
     try {
       const token = (await supabase.auth.getSession()).data.session?.access_token
       if (!token) throw new Error('Not authenticated')
 
       const fd = new FormData()
-      fd.append('file', file)
+      fd.append('file', salesFile)
 
-      const res = await fetch((import.meta as any).env.VITE_API_BASE + '/api/upload', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        body: fd
-      })
+      const res = await fetch(
+        (import.meta as any).env.VITE_API_BASE + '/api/upload',
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        }
+      )
+
       const data = await res.json()
-      setSummary(data)
+      setSalesSummary(data)
+
       if (!res.ok) {
-        addToast(data?.error || 'Upload failed', 'error')
+        addToast(data?.error || 'Sales upload failed', 'error')
       } else {
-        addToast(`Imported ${data.inserted} rows. Rejected ${data.rejectedCount}.`, 'success')
+        const inserted = data.inserted ?? 0
+        const rejected = data.rejectedCount ?? 0
+        addToast(`Imported ${inserted} sales rows. Rejected ${rejected}.`, 'success')
       }
     } catch (e: any) {
-      addToast(e.message || 'Upload failed', 'error')
+      addToast(e.message || 'Sales upload failed', 'error')
     } finally {
-      setUploading(false)
+      setSalesUploading(false)
+    }
+  }
+
+  /** ----------------- Upload Inventory ----------------- */
+  async function uploadInventory() {
+    if (!invFile) {
+      addToast('Please choose an inventory file', 'warning')
+      return
+    }
+    setInvUploading(true)
+    setInvSummary(null)
+    try {
+      const token = (await supabase.auth.getSession()).data.session?.access_token
+      if (!token) throw new Error('Not authenticated')
+
+      const fd = new FormData()
+      fd.append('file', invFile)
+
+      const res = await fetch(
+        (import.meta as any).env.VITE_API_BASE + '/api/inventory/upload',
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        }
+      )
+
+      const data = await res.json()
+      setInvSummary(data)
+
+      if (!res.ok) {
+        addToast(data?.error || 'Inventory upload failed', 'error')
+      } else {
+        const upd = data.inventory_rows ?? 0
+        const priceRows = data.price_rows ?? 0
+        addToast(`Inventory updated: ${upd}. Prices added: ${priceRows}.`, 'success')
+      }
+    } catch (e: any) {
+      addToast(e.message || 'Inventory upload failed', 'error')
+    } finally {
+      setInvUploading(false)
     }
   }
 
   return (
     <AppShell>
-      <div className="space-y-6">
+      <div className="space-y-8">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Data Upload</h1>
           <p className="text-gray-600">
-            Upload Excel/CSV with headers: <code>Date, Customer Name, Product, Quantity</code>{' '}
-            (<em>Price optional</em>)
+            Upload Sales and Inventory files. Your backend will validate, map, and import.
           </p>
         </div>
 
+        {/* ----------------- Sales Upload ----------------- */}
         <Card>
           <CardHeader>
-            <h3 className="text-lg font-semibold text-gray-900">Upload File</h3>
+            <h3 className="text-lg font-semibold text-gray-900">Sales Upload</h3>
+            <p className="text-sm text-gray-600">
+              Expected headers:&nbsp;
+              <code>Date, Customer Name, Product, Quantity, Price</code>
+            </p>
           </CardHeader>
           <CardContent className="space-y-4">
             <input
               type="file"
               accept=".xlsx,.xls,.csv"
-              onChange={onFileChange}
-              className="block w-full text-sm text-gray-700 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-primary-50 file:text-primary-700 hover:file:bg-primary-100"
+              onChange={onSalesFileChange}
+              className="block w-full text-sm text-gray-700
+                         file:mr-4 file:py-2 file:px-4
+                         file:rounded-lg file:border-0
+                         file:text-sm file:font-semibold
+                         file:bg-primary-50 file:text-primary-700
+                         hover:file:bg-primary-100"
             />
-            {errors.length > 0 && (
+            {salesErrors.length > 0 && (
               <Alert variant="error">
-                {errors.map((e, i) => (
-                  <div key={i}>{e}</div>
-                ))}
+                {salesErrors.map((e, i) => <div key={i}>{e}</div>)}
               </Alert>
             )}
-            {file && file.name.match(/\.(xlsx|xls)$/i) && (
+            {salesFile && isExcel(salesFile.name) && (
               <Alert variant="info">Preview for .xlsx is not shown here; server will validate and parse.</Alert>
+            )}
+
+            {salesRows.length > 0 && (
+              <div className="mt-4">
+                <h4 className="font-medium text-gray-900 mb-2">Preview (first 20 rows)</h4>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Date</TableHead>
+                      <TableHead>Customer Name</TableHead>
+                      <TableHead>Product</TableHead>
+                      <TableHead>Quantity</TableHead>
+                      <TableHead>Price</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {salesRows.map((r, i) => (
+                      <TableRow key={i}>
+                        <TableCell>{r.Date}</TableCell>
+                        <TableCell>{r['Customer Name']}</TableCell>
+                        <TableCell>{r.Product}</TableCell>
+                        <TableCell>{r.Quantity}</TableCell>
+                        <TableCell>{r.Price ?? ''}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
             )}
           </CardContent>
           <CardFooter className="flex justify-end">
-            <Button onClick={onUpload} disabled={uploading || !file}>
-              {uploading ? 'Uploading…' : 'Upload'}
+            <Button onClick={uploadSales} disabled={salesUploading || !salesFile}>
+              {salesUploading ? (
+                <span className="inline-flex items-center gap-2">
+                  <Spinner size="sm" /> Uploading…
+                </span>
+              ) : (
+                'Upload Sales'
+              )}
             </Button>
           </CardFooter>
+
+          {salesSummary?.reasonCounts && (
+            <div className="px-6 pb-6">
+              <Alert variant="warning">
+                <div className="font-semibold mb-2">Rejected rows breakdown</div>
+                <ul className="list-disc ml-6 space-y-1">
+                  {Object.entries(salesSummary.reasonCounts).map(([k, v]) => (
+                    <li key={k}>{k}: {v as number}</li>
+                  ))}
+                </ul>
+                {salesSummary.sampleRejected?.length > 0 && (
+                  <div className="mt-2 text-sm text-gray-700">
+                    Showing first {salesSummary.sampleRejected.length} rejected rows with reasons.
+                  </div>
+                )}
+              </Alert>
+            </div>
+          )}
         </Card>
 
-        {rows.length > 0 && (
-          <Card>
-            <CardHeader>
-              <h3 className="text-lg font-semibold text-gray-900">Preview (first 20 rows)</h3>
-            </CardHeader>
-            <CardContent>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Date</TableHead>
-                    <TableHead>Customer Name</TableHead>
-                    <TableHead>Product</TableHead>
-                    <TableHead>Quantity</TableHead>
-                    <TableHead>Price</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {rows.map((r, i) => (
-                    <TableRow key={i}>
-                      <TableCell>{r.Date}</TableCell>
-                      <TableCell>{r['Customer Name']}</TableCell>
-                      <TableCell>{r.Product}</TableCell>
-                      <TableCell>{r.Quantity}</TableCell>
-                      <TableCell>{r.Price ?? ''}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
-        )}
-
-        {summary?.reasonCounts && (
-          <Alert variant="warning">
-            <div className="font-semibold mb-2">Rejected rows breakdown</div>
-            <ul className="list-disc ml-6 space-y-1">
-              {Object.entries(summary.reasonCounts).map(([k, v]) => (
-                <li key={k}>
-                  {k}: {v as number}
-                </li>
-              ))}
-            </ul>
-            {summary.sampleRejected?.length > 0 && (
-              <div className="mt-2 text-sm text-gray-700">
-                Showing first {summary.sampleRejected.length} rejected rows with reasons.
-              </div>
+        {/* ----------------- Inventory Upload ----------------- */}
+        <Card>
+          <CardHeader>
+            <h3 className="text-lg font-semibold text-gray-900">Inventory Upload</h3>
+            <p className="text-sm text-gray-600">
+              Sheet should include columns like:&nbsp;
+              <code>Name, Sales Price (Current), Cost, Quantity On Hand</code>
+              . Product name matching is handled server-side (ignores leading [####] codes).
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <input
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              onChange={onInventoryFileChange}
+              className="block w-full text-sm text-gray-700
+                         file:mr-4 file:py-2 file:px-4
+                         file:rounded-lg file:border-0
+                         file:text-sm file:font-semibold
+                         file:bg-primary-50 file:text-primary-700
+                         hover:file:bg-primary-100"
+            />
+            {invErrors.length > 0 && (
+              <Alert variant="error">
+                {invErrors.map((e, i) => <div key={i}>{e}</div>)}
+              </Alert>
             )}
-          </Alert>
-        )}
+          </CardContent>
+          <CardFooter className="flex justify-end">
+            <Button onClick={uploadInventory} disabled={invUploading || !invFile}>
+              {invUploading ? (
+                <span className="inline-flex items-center gap-2">
+                  <Spinner size="sm" /> Uploading…
+                </span>
+              ) : (
+                'Upload Inventory'
+              )}
+            </Button>
+          </CardFooter>
+
+          {invSummary && (
+            <div className="px-6 pb-6">
+              <Alert variant="info">
+                <div>Imported products: {invSummary.imported_products ?? 0}</div>
+                <div>Inventory rows updated: {invSummary.inventory_rows ?? 0}</div>
+                <div>Price rows added: {invSummary.price_rows ?? 0}</div>
+                {invSummary.rejected && (
+                  <div className="mt-2 text-sm text-gray-700">
+                    Rejected {invSummary.rejected} rows. (Check server logs for details.)
+                  </div>
+                )}
+              </Alert>
+            </div>
+          )}
+        </Card>
       </div>
     </AppShell>
   )
