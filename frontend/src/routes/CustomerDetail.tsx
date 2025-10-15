@@ -48,7 +48,12 @@ export default function CustomerDetail() {
   return (
     <AppShell>
       <div className="space-y-6">
-        {loading && (<div className="flex items-center space-x-2"><Spinner size="sm" /><span className="text-gray-600">Loading…</span></div>)}
+        {loading && (
+          <div className="flex items-center space-x-2">
+            <Spinner size="sm" />
+            <span className="text-gray-600">Loading…</span>
+          </div>
+        )}
         {err && <Alert variant="error">{err}</Alert>}
         {!loading && !err && data && (
           <>
@@ -71,7 +76,7 @@ export default function CustomerDetail() {
               <CardContent>
                 <div className="h-80">
                   <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={data.monthly.map(m => ({ ...m, label: m.month.slice(0,7) }))}>
+                    <LineChart data={data.monthly.map(m => ({ ...m, label: m.month.slice(0, 7) }))}>
                       <CartesianGrid strokeDasharray="3 3" />
                       <XAxis dataKey="label" />
                       <YAxis />
@@ -84,7 +89,9 @@ export default function CustomerDetail() {
             </Card>
 
             <Card>
-              <CardHeader><h3 className="text-lg font-semibold text-gray-900">Products Purchased</h3></CardHeader>
+              <CardHeader>
+                <h3 className="text-lg font-semibold text-gray-900">Products Purchased</h3>
+              </CardHeader>
               <CardContent>
                 <Table>
                   <TableHeader>
@@ -102,12 +109,20 @@ export default function CustomerDetail() {
                         <TableCell className="font-medium">{p.product_name}</TableCell>
                         <TableCell className="text-right">{p.qty}</TableCell>
                         <TableCell className="text-right">
-                          <Button size="sm" variant="secondary" onClick={() => window.open(`/products/${p.product_id}`, '_blank')}>View Product</Button>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => window.open(`/products/${p.product_id}`, '_blank')}
+                          >
+                            View Product
+                          </Button>
                         </TableCell>
                       </TableRow>
                     ))}
                     {data.products.length === 0 && (
-                      <TableRow><TableCell colSpan={4} className="text-center text-gray-500">No purchases found.</TableCell></TableRow>
+                      <TableRow>
+                        <TableCell colSpan={4} className="text-center text-gray-500">No purchases found.</TableCell>
+                      </TableRow>
                     )}
                   </TableBody>
                 </Table>
