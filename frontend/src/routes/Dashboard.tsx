@@ -112,7 +112,7 @@ export default function Dashboard() {
               <Card>
                 <CardContent className="p-4">
                   <p className="text-xs text-gray-600">Revenue (last 12)</p>
-                  <p className="text-xl font-semibold text-gray-900">₹ {money(data.totals.sales_12m_revenue)}</p>
+                  <p className="text-xl font-semibold text-gray-900">$ {money(data.totals.sales_12m_revenue)}</p>
                 </CardContent>
               </Card>
             </div>
@@ -133,7 +133,7 @@ export default function Dashboard() {
                         <TableHead className="w-10">#</TableHead>
                         <TableHead className="max-w-[280px]">Product</TableHead>
                         <TableHead className="text-right w-20">On&nbsp;Hand</TableHead>
-                        <TableHead className="text-right w-24">Weighted&nbsp;MOQ</TableHead>
+                        <TableHead className="text-right w-24">MOQ</TableHead>
                         <TableHead className="text-right w-16">Gap</TableHead>
                         <TableHead className="text-right w-24">Actions</TableHead>
                       </TableRow>
@@ -202,8 +202,8 @@ export default function Dashboard() {
                             </div>
                           </TableCell>
                           <TableCell className="text-right">{fmt.format(p.qty_12m)}</TableCell>
-                          <TableCell className="text-right">₹ {money(p.revenue_12m)}</TableCell>
-                          <TableCell className="text-right">₹ {money(p.gross_profit_12m)}</TableCell>
+                          <TableCell className="text-right">$ {money(p.revenue_12m)}</TableCell>
+                          <TableCell className="text-right">$ {money(p.gross_profit_12m)}</TableCell>
                           <TableCell className="text-right">
                             <Button
                               size="sm"
