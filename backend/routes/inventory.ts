@@ -62,9 +62,9 @@ function sheetToAOA(buf: Buffer) {
 // Required header labels (normalized)
 const REQUIRED = [
   'name',
-  'sales price (current)',
+  'sales price',
   'cost',
-  'quantity on hand (stocks)'
+  'quantity on hand'
 ] as const
 
 type CleanRow = {
