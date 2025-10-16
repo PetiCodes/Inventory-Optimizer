@@ -1,4 +1,3 @@
-// backend/routes/inventory.ts
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
@@ -12,7 +11,7 @@ const upload = multer({
 
 /** ───────────────────────── Helpers ───────────────────────── **/
 
-// Safe string coercion (avoid calling global String() as a function)
+// Safe string coercion (never call String())
 const s = (v: any) => `${v ?? ''}`
 
 // Normalize for case-insensitive lookups
@@ -24,7 +23,6 @@ const norm = (v: any) =>
     .replace(/\s+/g, ' ')
 
 // Remove leading "[...]" code, then trim.
-// Example: "[40717] AURA POUCH" → "AURA POUCH"
 const stripLeadingTag = (v: any) => s(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
 
 // Number parser tolerant to "1,234", "1 234", "1.234,56", etc.
@@ -37,7 +35,7 @@ function parseNumber(input: any): number | null {
     t = t.replace(/\./g, '')  // thousands
     t = t.replace(',', '.')   // decimal
   } else {
-    t = t.replace(/[, ]/g, '') // remove thousands/space
+    t = t.replace(/[, ]/g, '') // remove separators
   }
   const n = Number(t)
   return Number.isFinite(n) ? n : null
@@ -63,9 +61,9 @@ function sheetToAOA(buf: Buffer) {
 // Required header labels (normalized)
 const REQUIRED = [
   'name',
-  'sales price',
+  'sales price (current)',
   'cost',
-  'quantity on hand'
+  'quantity on hand (stocks)'
 ] as const
 
 type CleanRow = {
@@ -89,19 +87,19 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Unable to parse file. Use .xlsx/.xls/.csv with headers.' })
     }
 
-    const headerRow = (aoa[0] ?? []).map((h: any) => s(h))
+    const headerRow = (aoa[0] ?? []).map(h => s(h))
     if (!headerRow.length) return res.status(400).json({ error: 'Header row missing' })
 
     const idxMap: Record<typeof REQUIRED[number], number> = {
       'name': -1,
-      'sales price': -1,
+      'sales price (current)': -1,
       'cost': -1,
-      'quantity on hand': -1
+      'quantity on hand (stocks)': -1
     }
 
-    headerRow.forEach((h: any, i: number) => {
+    headerRow.forEach((h, i) => {
       const nh = norm(h)
-      ;(REQUIRED as readonly string[]).forEach(reqH => {
+      (REQUIRED as readonly string[]).forEach(reqH => {
         if (idxMap[reqH as typeof REQUIRED[number]] === -1 && nh === reqH) {
           idxMap[reqH as typeof REQUIRED[number]] = i
         }
@@ -119,7 +117,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     // Body rows (non-empty)
     const rows = aoa
       .slice(1)
-      .filter((r: any[]) => r && r.some((c: any) => c !== null && c !== undefined && s(c).trim() !== ''))
+      .filter(r => r && r.some((c: any) => c !== null && c !== undefined && s(c).trim() !== ''))
 
     if (!rows.length) {
       return res.status(400).json({ error: 'No data rows found' })
@@ -134,12 +132,12 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     }
 
     // Parse + validate
-    rows.forEach((r: any[], i: number) => {
+    rows.forEach((r, i) => {
       const rowNum = i + 2
       const name = s(r[idxMap['name']]).trim()
-      const price = parseNumber(r[idxMap['sales price']])
+      const price = parseNumber(r[idxMap['sales price (current)']])
       const cost  = parseNumber(r[idxMap['cost']])
-      const onH   = parseNumber(r[idxMap['quantity on hand']])
+      const onH   = parseNumber(r[idxMap['quantity on hand (stocks)']])
 
       if (!name) return reject(rowNum, 'Missing Name')
       if (price === null) return reject(rowNum, 'Invalid Sales Price')
@@ -167,14 +165,16 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const allProds = await supabaseService.from('products').select('id,name')
     if (allProds.error) return res.status(500).json({ error: allProds.error.message })
 
-    const exactMap = new Map<string, string>()     // normalized exact name → id
-    const strippedMap = new Map<string, string>()  // normalized stripped name → id
+    // exact name map
+    const exactMap = new Map<string, string>()  // normalized exact name → id
+    // stripped tag map
+    const strippedMap = new Map<string, string>() // normalized stripped name → id
 
     for (const p of (allProds.data ?? [])) {
       const id = s(p.id)
-      const pname = s(p.name)
-      const exactKey = norm(pname)
-      const strippedKey = norm(stripLeadingTag(pname))
+      const name = s(p.name)
+      const exactKey = norm(name)
+      const strippedKey = norm(stripLeadingTag(name))
       if (exactKey && !exactMap.has(exactKey)) exactMap.set(exactKey, id)
       if (strippedKey && !strippedMap.has(strippedKey)) strippedMap.set(strippedKey, id)
     }
@@ -189,15 +189,20 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       const strippedKey = norm(stripLeadingTag(incoming))
 
       let product_id = exactMap.get(exactKey)
-      if (!product_id) product_id = strippedMap.get(strippedKey)
-
       let matched_name: string | undefined
+
+      if (!product_id) {
+        product_id = strippedMap.get(strippedKey)
+      }
+
       if (product_id) {
-        const found = (allProds.data ?? []).find((p: any) => s(p.id) === product_id)
+        // stash display name if we have it (find once)
+        const found = (allProds.data ?? []).find(p => s(p.id) === product_id)
         matched_name = s(found?.name ?? incoming)
       }
 
       if (!product_id) {
+        // No auto-create to avoid duplicates; count as rejected
         reject(-1, `No matching product for "${incoming}"`)
         continue
       }
@@ -216,7 +221,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     const todayISO = new Date().toISOString().slice(0, 10)
 
-    /** Build payloads **/
+    // Build payloads
     type PriceRow = {
       product_id: string
       effective_date: string
@@ -226,8 +231,8 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     }
     type InvRow = {
       product_id: string
+      as_of_date: string
       on_hand: number
-      backorder?: number | null
       source?: string
     }
 
@@ -238,55 +243,49 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       const pid = s(r.product_id)
       pricePayload.push({
         product_id: pid,
-        effective_date: todayISO,                    // history (per-day)
+        effective_date: todayISO,
         unit_cost: Number(r.unit_cost) || 0,
         unit_price: Number(r.unit_price) || 0,
-        source: 'inventory_upload'
+        source: 'inventory'
       })
       invPayload.push({
         product_id: pid,
-        on_hand: Number(r.on_hand) || 0,             // current level snapshot
-        backorder: 0,
-        source: 'inventory_upload'
+        as_of_date: todayISO,
+        on_hand: Number(r.on_hand) || 0,
+        source: 'inventory'
       })
     }
 
-    /** Insert in chunks **/
-
-    // 1) product_prices: conflict on (product_id, effective_date)
+    // Insert in chunks; onConflict ensures one row per day per product
     let priceInserted = 0
     for (const part of chunk(pricePayload, 500)) {
       const ins = await supabaseService
         .from('product_prices')
         .upsert(part, { onConflict: 'product_id,effective_date' })
-
       if (ins.error) {
         console.error('product_prices upsert error:', ins.error)
         return res.status(500).json({ error: ins.error.message })
       }
-      // supabase upsert often doesn't return count; fall back to batch size
-      priceInserted += (ins.count ?? part.length)
+      priceInserted += (ins.count as number) ?? part.length
     }
 
-    // 2) inventory_current: one row per product
-    let invUpserts = 0
+    let invInserted = 0
     for (const part of chunk(invPayload, 500)) {
       const ins2 = await supabaseService
-        .from('inventory_current')
-        .upsert(part, { onConflict: 'product_id' })
-
+        .from('inventory_levels')
+        .upsert(part, { onConflict: 'product_id,as_of_date' })
       if (ins2.error) {
-        console.error('inventory_current upsert error:', ins2.error)
+        console.error('inventory_levels upsert error:', ins2.error)
         return res.status(500).json({ error: ins2.error.message })
       }
-      invUpserts += (ins2.count ?? part.length)
+      invInserted += (ins2.count as number) ?? part.length
     }
 
     // Done
     return res.json({
       matched_products: resolved.length,
       price_rows: priceInserted,
-      inventory_rows: invUpserts,
+      inventory_rows: invInserted,
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
       sampleRejected: rejected.slice(0, 50)
