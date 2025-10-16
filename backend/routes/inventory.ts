@@ -11,24 +11,25 @@ const upload = multer({
 
 /** ───────────────────────── Helpers ───────────────────────── **/
 
-// Safe string coercion (never call String())
-const s = (v: any) => `${v ?? ''}`
+// Safe string coercion (never call global String())
+const toStr = (v: any): string => (v === null || v === undefined ? '' : String(v))
 
 // Normalize for case-insensitive lookups
-const norm = (v: any) =>
-  s(v)
+const norm = (v: any): string =>
+  toStr(v)
     .replace(/^\uFEFF/, '') // strip BOM
     .trim()
     .toLowerCase()
     .replace(/\s+/g, ' ')
 
 // Remove leading "[...]" code, then trim.
-const stripLeadingTag = (v: any) => s(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
+const stripLeadingTag = (v: any): string =>
+  toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
 
 // Number parser tolerant to "1,234", "1 234", "1.234,56", etc.
 function parseNumber(input: any): number | null {
   if (input === null || input === undefined) return null
-  let t = s(input).trim()
+  let t = toStr(input).trim()
   if (!t) return null
   // If comma is decimal sep (e.g., "1.234,56")
   if (/,/.test(t) && !/\.\d+$/.test(t) && /,\d+$/.test(t)) {
@@ -77,20 +78,24 @@ type CleanRow = {
 
 router.post('/inventory/upload', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'File is required (field name "file")' })
+    if (!req.file)
+      return res.status(400).json({ error: 'File is required (field name "file")' })
 
     // Parse sheet → header map
     let aoa: any[][]
     try {
       aoa = sheetToAOA(req.file.buffer)
     } catch {
-      return res.status(400).json({ error: 'Unable to parse file. Use .xlsx/.xls/.csv with headers.' })
+      return res.status(400).json({
+        error: 'Unable to parse file. Use .xlsx/.xls/.csv with headers.'
+      })
     }
 
-    const headerRow = (aoa[0] ?? []).map(h => s(h))
-    if (!headerRow.length) return res.status(400).json({ error: 'Header row missing' })
+    const headerRow = (aoa[0] ?? []).map(h => toStr(h))
+    if (!headerRow.length)
+      return res.status(400).json({ error: 'Header row missing' })
 
-    const idxMap: Record<typeof REQUIRED[number], number> = {
+    const idxMap: Record<(typeof REQUIRED)[number], number> = {
       'name': -1,
       'sales price (current)': -1,
       'cost': -1,
@@ -99,17 +104,16 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     headerRow.forEach((h, i) => {
       const nh = norm(h)
-      (REQUIRED as readonly string[]).forEach(reqH => {
-        if (idxMap[reqH as typeof REQUIRED[number]] === -1 && nh === reqH) {
-          idxMap[reqH as typeof REQUIRED[number]] = i
-        }
+      REQUIRED.forEach(reqH => {
+        if (idxMap[reqH] === -1 && nh === reqH) idxMap[reqH] = i
       })
     })
 
     const missing = REQUIRED.filter(k => idxMap[k] === -1)
     if (missing.length) {
       return res.status(400).json({
-        error: 'Invalid headers. Expected: Name, Sales Price (Current), Cost, Quantity On Hand (Stocks)',
+        error:
+          'Invalid headers. Expected: Name, Sales Price (Current), Cost, Quantity On Hand (Stocks)',
         details: { received: headerRow, missing }
       })
     }
@@ -117,11 +121,10 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     // Body rows (non-empty)
     const rows = aoa
       .slice(1)
-      .filter(r => r && r.some((c: any) => c !== null && c !== undefined && s(c).trim() !== ''))
+      .filter(r => r && r.some((c: any) => c !== null && c !== undefined && toStr(c).trim() !== ''))
 
-    if (!rows.length) {
+    if (!rows.length)
       return res.status(400).json({ error: 'No data rows found' })
-    }
 
     const clean: CleanRow[] = []
     const rejected: { row: number; reason: string }[] = []
@@ -134,22 +137,17 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     // Parse + validate
     rows.forEach((r, i) => {
       const rowNum = i + 2
-      const name = s(r[idxMap['name']]).trim()
+      const name = toStr(r[idxMap['name']]).trim()
       const price = parseNumber(r[idxMap['sales price (current)']])
-      const cost  = parseNumber(r[idxMap['cost']])
-      const onH   = parseNumber(r[idxMap['quantity on hand (stocks)']])
+      const cost = parseNumber(r[idxMap['cost']])
+      const onH = parseNumber(r[idxMap['quantity on hand (stocks)']])
 
       if (!name) return reject(rowNum, 'Missing Name')
       if (price === null) return reject(rowNum, 'Invalid Sales Price')
-      if (cost === null)  return reject(rowNum, 'Invalid Cost')
-      if (onH === null)   return reject(rowNum, 'Invalid On Hand')
+      if (cost === null) return reject(rowNum, 'Invalid Cost')
+      if (onH === null) return reject(rowNum, 'Invalid On Hand')
 
-      clean.push({
-        name,
-        unit_price: price,
-        unit_cost: cost,
-        on_hand: onH
-      })
+      clean.push({ name, unit_price: price, unit_cost: cost, on_hand: onH })
     })
 
     if (!clean.length) {
@@ -163,16 +161,15 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     // Build name → id maps from existing products
     const allProds = await supabaseService.from('products').select('id,name')
-    if (allProds.error) return res.status(500).json({ error: allProds.error.message })
+    if (allProds.error)
+      return res.status(500).json({ error: allProds.error.message })
 
-    // exact name map
-    const exactMap = new Map<string, string>()  // normalized exact name → id
-    // stripped tag map
-    const strippedMap = new Map<string, string>() // normalized stripped name → id
+    const exactMap = new Map<string, string>()
+    const strippedMap = new Map<string, string>()
 
-    for (const p of (allProds.data ?? [])) {
-      const id = s(p.id)
-      const name = s(p.name)
+    for (const p of allProds.data ?? []) {
+      const id = toStr(p.id)
+      const name = toStr(p.name)
       const exactKey = norm(name)
       const strippedKey = norm(stripLeadingTag(name))
       if (exactKey && !exactMap.has(exactKey)) exactMap.set(exactKey, id)
@@ -180,11 +177,11 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     }
 
     // Resolve each clean row → product_id using exact OR stripped matching
-    type Resolved = CleanRow & { product_id?: string, matched_name?: string }
+    type Resolved = CleanRow & { product_id?: string; matched_name?: string }
     const resolved: Resolved[] = []
 
     for (const r of clean) {
-      const incoming = s(r.name)
+      const incoming = toStr(r.name)
       const exactKey = norm(incoming)
       const strippedKey = norm(stripLeadingTag(incoming))
 
@@ -196,13 +193,11 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       }
 
       if (product_id) {
-        // stash display name if we have it (find once)
-        const found = (allProds.data ?? []).find(p => s(p.id) === product_id)
-        matched_name = s(found?.name ?? incoming)
+        const found = (allProds.data ?? []).find(p => toStr(p.id) === product_id)
+        matched_name = toStr(found?.name ?? incoming)
       }
 
       if (!product_id) {
-        // No auto-create to avoid duplicates; count as rejected
         reject(-1, `No matching product for "${incoming}"`)
         continue
       }
@@ -221,7 +216,6 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     const todayISO = new Date().toISOString().slice(0, 10)
 
-    // Build payloads
     type PriceRow = {
       product_id: string
       effective_date: string
@@ -237,10 +231,10 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     }
 
     const pricePayload: PriceRow[] = []
-    const invPayload:   InvRow[]   = []
+    const invPayload: InvRow[] = []
 
     for (const r of resolved) {
-      const pid = s(r.product_id)
+      const pid = toStr(r.product_id)
       pricePayload.push({
         product_id: pid,
         effective_date: todayISO,
@@ -281,7 +275,6 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       invInserted += (ins2.count as number) ?? part.length
     }
 
-    // Done
     return res.json({
       matched_products: resolved.length,
       price_rows: priceInserted,
