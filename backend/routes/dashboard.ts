@@ -18,7 +18,6 @@ function lastNMonthsUTC(n: number): string[] {
 }
 
 function monthKeyFromDateStr(isoDate: string): string {
-  // expects YYYY-MM-DD; returns YYYY-MM-01
   if (!isoDate || isoDate.length < 7) return ''
   const y = isoDate.slice(0, 4)
   const m = isoDate.slice(5, 7)
@@ -28,37 +27,32 @@ function monthKeyFromDateStr(isoDate: string): string {
 const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
 
-/** Safe wrapper: never throw, always return { data?: T; error?: string } */
-async function safe<T>(p: Promise<{ data: T | null; error: any }>, label: string) {
+/** Accept any Supabase query builder, await it, and unwrap {data,error} safely */
+async function safeQ<T>(q: any, label: string): Promise<{ data: T | null; error?: string }> {
   try {
-    const { data, error } = await p
+    const { data, error } = await q
     if (error) {
       console.error(`[dashboard] ${label} error:`, error)
-      return { data: null as T | null, error: String(error.message || error) }
+      return { data: null, error: String(error.message || error) }
     }
     return { data: (data ?? null) as T | null }
   } catch (e: any) {
     console.error(`[dashboard] ${label} exception:`, e)
-    return { data: null as T | null, error: String(e?.message || e) }
+    return { data: null, error: String(e?.message || e) }
   }
 }
 
 router.get('/dashboard/overview', async (_req, res) => {
   try {
     const months = lastNMonthsUTC(12)
-    const start12 = months[0] // inclusive
+    const start12 = months[0]
 
-    /** 1) Totals (products, customers) */
+    /** 1) Totals (products, customers) – use head:true for fast count; fall back if needed */
     let productsCount = 0
     {
-      const r = await safe(supabaseService.from('products').select('id', { count: 'exact', head: true }), 'products count')
-      if (!r.error && (r as any).count !== undefined) {
-        // head:true doesn’t return data; supabase-js exposes count on response object,
-        // but safe() returns only data. Re-run as plain try/catch for count:
-        const head = await supabaseService.from('products').select('id', { count: 'exact', head: true })
-        if (!head.error) productsCount = head.count ?? 0
-      } else {
-        // fallback: non-head count
+      const head = await supabaseService.from('products').select('id', { count: 'exact', head: true })
+      if (!head.error) productsCount = head.count ?? 0
+      else {
         const all = await supabaseService.from('products').select('id', { count: 'exact' })
         if (!all.error) productsCount = all.count ?? 0
       }
@@ -76,7 +70,7 @@ router.get('/dashboard/overview', async (_req, res) => {
 
     /** 2) Sales (last 12 months) */
     type SaleRow = { product_id: string; date: string; quantity: number; unit_price: number | null }
-    const sales12 = await safe<SaleRow[]>(
+    const sales12 = await safeQ<SaleRow[]>(
       supabaseService.from('sales').select('product_id, date, quantity, unit_price').gte('date', start12),
       'sales last12'
     )
@@ -93,7 +87,7 @@ router.get('/dashboard/overview', async (_req, res) => {
 
     /** 3) Current unit cost (view may not exist in some envs) */
     type CostRow = { product_id: string; unit_cost: number | null }
-    const costNow = await safe<CostRow[]>(
+    const costNow = await safeQ<CostRow[]>(
       supabaseService.from('v_product_current_price').select('product_id, unit_cost'),
       'v_product_current_price'
     )
@@ -101,13 +95,12 @@ router.get('/dashboard/overview', async (_req, res) => {
     if (Array.isArray(costNow.data)) {
       for (const r of costNow.data) costMap.set(String(r.product_id), Number(r.unit_cost ?? 0))
     } else {
-      // If view missing/blocked, we’ll just assume 0 cost so the route still succeeds
-      console.warn('[dashboard] v_product_current_price not available; gross_profit will assume unit_cost=0')
+      console.warn('[dashboard] v_product_current_price not available; assuming unit_cost=0')
     }
 
     /** 4) Inventory on hand */
     type InvRow = { product_id: string; on_hand: number | null }
-    const inv = await safe<InvRow[]>(
+    const inv = await safeQ<InvRow[]>(
       supabaseService.from('inventory_current').select('product_id, on_hand'),
       'inventory_current'
     )
@@ -163,11 +156,10 @@ router.get('/dashboard/overview', async (_req, res) => {
     const nameMap = new Map<string, string>()
     if (productIds.size > 0) {
       const idList = Array.from(productIds)
-      const chunks: string[][] = []
-      for (let i = 0; i < idList.length; i += 900) chunks.push(idList.slice(i, i + 900)) // stay below URL limits
-
-      for (const part of chunks) {
-        const namesRes = await safe<{ id: string; name: string | null }[]>(
+      // Chunk to avoid URL limits
+      for (let i = 0; i < idList.length; i += 900) {
+        const part = idList.slice(i, i + 900)
+        const namesRes = await safeQ<{ id: string; name: string | null }[]>(
           supabaseService.from('products').select('id,name').in('id', part),
           'products names'
         )
@@ -254,7 +246,7 @@ router.get('/dashboard/overview', async (_req, res) => {
     })
   } catch (e: any) {
     console.error('GET /dashboard/overview fatal error:', e)
-    // Still return a valid payload shape so the UI doesn't break
+    // Always return a valid shape so the UI doesn't break
     return res.status(200).json({
       totals: { products: 0, customers: 0, sales_12m_qty: 0, sales_12m_revenue: 0 },
       atRisk: [],
