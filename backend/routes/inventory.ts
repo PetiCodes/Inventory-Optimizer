@@ -1,3 +1,4 @@
+// backend/routes/inventory.ts
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
@@ -59,13 +60,21 @@ function sheetToAOA(buf: Buffer) {
   return aoa
 }
 
-// Required header labels (normalized)
+/** Canonical header names (normalized) expected from your file */
 const REQUIRED = [
   'name',
-  'sales price (current)',
+  'sales price',
   'cost',
-  'quantity on hand (stocks)'
+  'quantity on hand'
 ] as const
+
+/** Allow a few legacy/alternate header labels as aliases (all normalized) */
+const HEADER_ALIASES: Record<(typeof REQUIRED)[number], string[]> = {
+  'name': [],
+  'sales price': ['sales price (current)'],
+  'cost': [],
+  'quantity on hand': ['quantity on hand (stocks)']
+}
 
 type CleanRow = {
   name: string
@@ -95,25 +104,30 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     if (!headerRow.length)
       return res.status(400).json({ error: 'Header row missing' })
 
+    // Build index map for required headers, accepting aliases
     const idxMap: Record<(typeof REQUIRED)[number], number> = {
       'name': -1,
-      'sales price (current)': -1,
+      'sales price': -1,
       'cost': -1,
-      'quantity on hand (stocks)': -1
+      'quantity on hand': -1
     }
 
-    headerRow.forEach((h, i) => {
-      const nh = norm(h)
-      REQUIRED.forEach(reqH => {
-        if (idxMap[reqH] === -1 && nh === reqH) idxMap[reqH] = i
-      })
+    const normalizedHeaders = headerRow.map(h => norm(h))
+
+    normalizedHeaders.forEach((nh, i) => {
+      for (const key of REQUIRED) {
+        if (idxMap[key] !== -1) continue
+        if (nh === key || HEADER_ALIASES[key].includes(nh)) {
+          idxMap[key] = i
+        }
+      }
     })
 
     const missing = REQUIRED.filter(k => idxMap[k] === -1)
     if (missing.length) {
       return res.status(400).json({
         error:
-          'Invalid headers. Expected: Name, Sales Price (Current), Cost, Quantity On Hand (Stocks)',
+          'Invalid headers. Expected: Name, Sales Price, Cost, Quantity On Hand',
         details: { received: headerRow, missing }
       })
     }
@@ -138,14 +152,14 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     rows.forEach((r, i) => {
       const rowNum = i + 2
       const name = toStr(r[idxMap['name']]).trim()
-      const price = parseNumber(r[idxMap['sales price (current)']])
-      const cost = parseNumber(r[idxMap['cost']])
-      const onH = parseNumber(r[idxMap['quantity on hand (stocks)']])
+      const price = parseNumber(r[idxMap['sales price']])
+      const cost  = parseNumber(r[idxMap['cost']])
+      const onH   = parseNumber(r[idxMap['quantity on hand']])
 
       if (!name) return reject(rowNum, 'Missing Name')
       if (price === null) return reject(rowNum, 'Invalid Sales Price')
-      if (cost === null) return reject(rowNum, 'Invalid Cost')
-      if (onH === null) return reject(rowNum, 'Invalid On Hand')
+      if (cost === null)  return reject(rowNum, 'Invalid Cost')
+      if (onH === null)   return reject(rowNum, 'Invalid On Hand')
 
       clean.push({ name, unit_price: price, unit_cost: cost, on_hand: onH })
     })
