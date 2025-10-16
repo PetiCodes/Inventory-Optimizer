@@ -26,12 +26,17 @@ function keyMonth(dateIso: string) {
   return `${dateIso.slice(0, 4)}-${dateIso.slice(5, 7)}-01`
 }
 
-/* ───────────────────────── Small retry helper ───────────────────────── */
-async function withRetry<T>(fn: () => Promise<T>, tries = 3, delayMs = 250): Promise<T> {
+/* ───────────────────────── Retry that accepts "thenables" ─────────────────────────
+   Supabase query builders are thenables (await-able) but not typed as Promise<T>.
+   This wrapper coerces anything returned by fn() into an awaited result.
+*/
+async function withRetry<T = any>(fn: () => any, tries = 3, delayMs = 250): Promise<T> {
   let lastErr: any
   for (let i = 0; i < tries; i++) {
     try {
-      return await fn()
+      // If fn returns a PostgrestFilterBuilder (thenable), this will await it correctly.
+      const out = await Promise.resolve(fn())
+      return out as T
     } catch (e: any) {
       lastErr = e
       await new Promise(r => setTimeout(r, delayMs * (i + 1)))
@@ -66,19 +71,17 @@ function costAtDate(timeline: { d: string; c: number }[] | undefined, saleDate: 
   return ans >= 0 ? timeline[ans].c : 0
 }
 
-/* ───────────────────────── Chunked fetch helper ───────────────────────── */
+/* ───────────────────────── Chunked price fetch ───────────────────────── */
 async function fetchPricesInChunks(
   productIds: string[],
   endDate: string
 ): Promise<PriceRow[]> {
+  if (!productIds.length) return []
   const chunkSize = 800 // keep URL/query small
-  const chunks: string[][] = []
-  for (let i = 0; i < productIds.length; i += chunkSize) {
-    chunks.push(productIds.slice(i, i + chunkSize))
-  }
   const results: PriceRow[] = []
-  for (const ids of chunks) {
-    const { data, error } = await withRetry(() =>
+  for (let i = 0; i < productIds.length; i += chunkSize) {
+    const ids = productIds.slice(i, i + chunkSize)
+    const { data, error } = await withRetry<{ data: PriceRow[]; error: any }>(() =>
       supabaseService
         .from('product_prices')
         .select('product_id,effective_date,unit_cost')
@@ -86,7 +89,7 @@ async function fetchPricesInChunks(
         .lte('effective_date', endDate)
     )
     if (error) throw error
-    results.push(...(data as PriceRow[] ?? []))
+    results.push(...(data ?? []))
   }
   return results
 }
@@ -122,12 +125,19 @@ router.get('/dashboard/overview', async (_req, res) => {
     type SaleRow = { product_id: string; date: string; quantity: number; unit_price: number | null }
     const sales = (salesQ.data ?? []) as SaleRow[]
 
-    const nameMap = new Map<string, string>((namesQ.data ?? []).map((r: any) => [String(r.id), String(r.name ?? '(unnamed)')]))
+    // Name map (fallback only if truly empty)
+    const nameMap = new Map<string, string>(
+      (namesQ.data ?? []).map((r: any) => {
+        const nm = (r.name ?? '').toString().trim()
+        return [String(r.id), nm || '(unnamed)']
+      })
+    )
+
     const onHandMap = new Map<string, number>((invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)]))
 
     // 2) Only fetch prices for products that appear in the last-12-month sales
     const productIds = Array.from(new Set(sales.map(s => String(s.product_id))))
-    const priceData: PriceRow[] = productIds.length ? await fetchPricesInChunks(productIds, endDate) : []
+    const priceData = await fetchPricesInChunks(productIds, endDate)
     const costTimeline = buildCostTimeline(priceData)
 
     // 3) Build month index for last 12
