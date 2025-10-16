@@ -192,7 +192,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     let invInserted = 0
     for (const part of chunk(uniqInv, 500)) {
-      const ins2 = await supabaseService.from('inventory_levels').upsert(part, { onConflict: 'product_id,as_of_date' })
+      const ins2 = await supabaseService.from('inventory_current').upsert(part, { onConflict: 'product_id,as_of_date' })
       if (ins2.error) { console.error('inventory_current upsert error:', ins2.error); return res.status(500).json({ error: ins2.error.message }) }
       invInserted += part.length
     }
