@@ -1,4 +1,3 @@
-// backend/src/server.ts
 import express from 'express'
 import helmet from 'helmet'
 import cors from 'cors'
@@ -15,66 +14,54 @@ import inventoryRouter from '../routes/inventory.js'
 
 const app = express()
 
-// --- CORS: allow your frontend origin(s) + Authorization header ---
-function parseOrigins(src?: string): string[] | boolean {
-  if (!src || src.trim() === '') return ['http://localhost:5173']
-  const arr = src.split(',').map(s => s.trim()).filter(Boolean)
-  return arr.length ? arr : ['http://localhost:5173']
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // allow images/fonts if any
+}))
+
+// Build allowed origins from env + sensible defaults
+const allowList = new Set<string>([
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  // add your exact Vercel URL(s) below:
+  'https://inventory-optimizer-five.vercel.app',
+  'https://inventory-optimizer-21kc.onrender.com',
+])
+
+// Also allow any *.vercel.app if you spin previews:
+const vercelRegex = /\.vercel\.app$/
+
+const corsOptions: cors.CorsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true) // allow curl/postman
+    if (allowList.has(origin) || vercelRegex.test(origin)) return cb(null, true)
+    return cb(new Error(`CORS blocked for origin: ${origin}`))
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  optionsSuccessStatus: 204,
 }
+app.use(cors(corsOptions))
 
-const allowedOrigins = parseOrigins(process.env.CORS_ORIGIN as string | undefined)
+// Important: respond to preflight quickly
+app.options('*', cors(corsOptions))
 
-app.use(helmet())
-// Note: helmet sets some defaults that are fine with CORS; if you ever serve iframes/images from other origins,
-// consider adjusting specific Helmet policies.
-
-app.use(
-  cors({
-    origin: allowedOrigins,
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    maxAge: 600, // cache preflight for 10 minutes
-  })
-)
-// Ensure OPTIONS preflights are handled for every route
-app.options('*', cors())
-
-// Body parser (JSON routes only; multipart handled by multer inside routes)
-app.use(express.json({ limit: '10mb' }))
+app.use(express.json({ limit: '2mb' }))
 app.use(morgan('dev'))
 
-// --- Health endpoints ---
 app.get('/', (_req, res) => res.type('text/plain').send('Backend is up.'))
 app.get('/health', (_req, res) => res.json({ ok: true }))
-app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// --- API routes ---
 app.use('/api', meRouter)
-app.use('/api', uploadRouter)
+app.use('/api', uploadRouter)       // POST /api/upload
 app.use('/api', analysisRouter)
 app.use('/api', productsRouter)
 app.use('/api', dashboardRouter)
 app.use('/api', customersRouter)
-app.use('/api', inventoryRouter)
+app.use('/api', inventoryRouter)    // POST /api/inventory/upload
 
-// 404 handler (JSON)
-app.use((_req, res) => {
-  res.status(404).json({ error: 'Not found' })
-})
-
-// Central error handler (prevents hard crashes → “Failed to fetch” on client)
-app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error('Unhandled error:', err)
-  const status = typeof err?.status === 'number' ? err.status : 500
-  res.status(status).json({ error: err?.message || 'Server error' })
-})
+// fallback 404 (optional)
+app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
 
 const port = Number(process.env.PORT || 4000)
-app.listen(port, () => {
-  console.log(`API listening on http://localhost:${port}`)
-  console.log('Allowed CORS origins:', allowedOrigins)
-})
-
-// (optional) export for testing
-export default app
+app.listen(port, () => console.log(`API listening on http://localhost:${port}`))
