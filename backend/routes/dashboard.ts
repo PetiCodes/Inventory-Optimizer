@@ -1,196 +1,108 @@
-// routes/dashboard.ts
+// backend/routes/dashboard.ts
 import { Router } from 'express'
 import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
-/* ───────────────────────── Date helpers ───────────────────────── */
-const pad2 = (n: number) => String(n).padStart(2, '0')
-const ymd = (d: Date) =>
-  `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`
-const monthStart = (d: Date) =>
-  `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-01`
+/** Helpers */
+const startOfMonthISO = (d: Date) =>
+  `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`
 
-function last12Start(): string {
+function lastNMonthsUTC(n: number): string[] {
   const now = new Date()
-  const first = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11, 1))
-  return monthStart(first)
+  const arr: string[] = []
+  for (let i = n - 1; i >= 0; i--) {
+    const dt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1))
+    arr.push(startOfMonthISO(dt))
+  }
+  return arr
 }
-const todayISO = () => ymd(new Date())
+function monthKeyFromDateStr(isoDate: string): string {
+  if (!isoDate || isoDate.length < 7) return ''
+  const y = isoDate.slice(0, 4)
+  const m = isoDate.slice(5, 7)
+  return `${y}-${m}-01`
+}
 
 const weights12 = Array.from({ length: 12 }, (_, i) => i + 1) // 1..12
-const wSum12 = weights12.reduce((a, b) => a + b, 0)
+const wSum12 = weights12.reduce((a, b) => a + b, 0) // 78
 
-function keyMonth(dateIso: string) {
-  if (!dateIso || dateIso.length < 7) return ''
-  return `${dateIso.slice(0, 4)}-${dateIso.slice(5, 7)}-01`
-}
+type SaleRow = { product_id: string; date: string; quantity: number; unit_price: number | null }
+type NameRow = { id: string; name: string | null }
+type CostRow = { product_id: string; unit_cost: number | null }
+type InvRow  = { product_id: string; on_hand: number | null }
 
-/* ───────────────────────── Retry that accepts "thenables" ─────────────────────────
-   Supabase query builders are thenables (await-able) but not typed as Promise<T>.
-   This wrapper coerces anything returned by fn() into an awaited result.
-*/
-async function withRetry<T = any>(fn: () => any, tries = 3, delayMs = 250): Promise<T> {
-  let lastErr: any
-  for (let i = 0; i < tries; i++) {
-    try {
-      // If fn returns a PostgrestFilterBuilder (thenable), this will await it correctly.
-      const out = await Promise.resolve(fn())
-      return out as T
-    } catch (e: any) {
-      lastErr = e
-      await new Promise(r => setTimeout(r, delayMs * (i + 1)))
-    }
-  }
-  throw lastErr
-}
-
-/* ───────────────────────── Build/read cost timelines ───────────────────────── */
-type PriceRow = { product_id: string; effective_date: string; unit_cost: number | null }
-
-function buildCostTimeline(prices: PriceRow[]) {
-  const map = new Map<string, { d: string; c: number }[]>()
-  for (const p of prices) {
-    const pid = String(p.product_id)
-    const arr = map.get(pid) ?? []
-    arr.push({ d: String(p.effective_date), c: Number(p.unit_cost ?? 0) })
-    map.set(pid, arr)
-  }
-  for (const [pid, arr] of map) arr.sort((a, b) => a.d.localeCompare(b.d))
-  return map
-}
-
-function costAtDate(timeline: { d: string; c: number }[] | undefined, saleDate: string) {
-  if (!timeline || !timeline.length) return 0
-  // binary search: latest effective_date <= saleDate
-  let lo = 0, hi = timeline.length - 1, ans = -1
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1
-    if (timeline[mid].d <= saleDate) { ans = mid; lo = mid + 1 } else { hi = mid - 1 }
-  }
-  return ans >= 0 ? timeline[ans].c : 0
-}
-
-/* ───────────────────────── Chunked price fetch ───────────────────────── */
-async function fetchPricesInChunks(
-  productIds: string[],
-  endDate: string
-): Promise<PriceRow[]> {
-  if (!productIds.length) return []
-  const chunkSize = 800 // keep URL/query small
-  const results: PriceRow[] = []
-  for (let i = 0; i < productIds.length; i += chunkSize) {
-    const ids = productIds.slice(i, i + chunkSize)
-    const { data, error } = await withRetry<{ data: PriceRow[]; error: any }>(() =>
-      supabaseService
-        .from('product_prices')
-        .select('product_id,effective_date,unit_cost')
-        .in('product_id', ids)
-        .lte('effective_date', endDate)
-    )
-    if (error) throw error
-    results.push(...(data ?? []))
-  }
-  return results
-}
-
-/* ───────────────────────── Route ───────────────────────── */
 router.get('/dashboard/overview', async (_req, res) => {
   try {
-    const start12 = last12Start()
-    const endDate = todayISO()
-
-    // 1) Parallel lightweight queries
-    const [prodHead, custHead, salesQ, namesQ, invQ] = await Promise.all([
-      supabaseService.from('products').select('id', { count: 'exact', head: true }),
-      supabaseService.from('customers').select('id', { count: 'exact', head: true }),
-      // last-12-month sales only
-      supabaseService.from('sales')
-        .select('product_id,date,quantity,unit_price')
-        .gte('date', start12)
-        .lte('date', endDate),
-      supabaseService.from('products').select('id,name'),
-      supabaseService.from('inventory_current').select('product_id,on_hand')
-    ])
-
-    if (prodHead.error) throw prodHead.error
-    if (custHead.error) throw custHead.error
-    if (salesQ.error) throw salesQ.error
-    if (namesQ.error) throw namesQ.error
-    if (invQ.error) throw invQ.error
-
+    // 1) Totals
+    const prodHead = await supabaseService.from('products').select('id', { count: 'exact', head: true })
+    if (prodHead.error) return res.status(500).json({ error: prodHead.error.message })
     const productsCount = prodHead.count ?? 0
+
+    const custHead = await supabaseService.from('customers').select('id', { count: 'exact', head: true })
+    if (custHead.error) return res.status(500).json({ error: custHead.error.message })
     const customersCount = custHead.count ?? 0
 
-    type SaleRow = { product_id: string; date: string; quantity: number; unit_price: number | null }
-    const sales = (salesQ.data ?? []) as SaleRow[]
+    // 2) Last 12 months basic totals (qty/revenue) – light scan, no cost join
+    const months = lastNMonthsUTC(12)
+    const start12 = months[0]
 
-    // Name map (fallback only if truly empty)
-    const nameMap = new Map<string, string>(
-      (namesQ.data ?? []).map((r: any) => {
-        const nm = (r.name ?? '').toString().trim()
-        return [String(r.id), nm || '(unnamed)']
-      })
-    )
+    const s12 = await supabaseService
+      .from('sales')
+      .select('product_id, date, quantity, unit_price')
+      .gte('date', start12)
 
-    const onHandMap = new Map<string, number>((invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)]))
+    if (s12.error) return res.status(500).json({ error: s12.error.message })
+    const salesRows = (s12.data ?? []) as SaleRow[]
 
-    // 2) Only fetch prices for products that appear in the last-12-month sales
-    const productIds = Array.from(new Set(sales.map(s => String(s.product_id))))
-    const priceData = await fetchPricesInChunks(productIds, endDate)
-    const costTimeline = buildCostTimeline(priceData)
-
-    // 3) Build month index for last 12
-    const months: string[] = []
-    const idxMap = new Map<string, number>()
-    {
-      const now = new Date()
-      for (let i = 11; i >= 0; i--) {
-        const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1))
-        const mk = monthStart(d)
-        months.push(mk)
-      }
-      months.forEach((m, i) => idxMap.set(m, i))
+    let salesQty12 = 0
+    let salesRevenue12 = 0
+    for (const r of salesRows) {
+      const q  = Number(r.quantity ?? 0)
+      const up = Number(r.unit_price ?? 0)
+      salesQty12 += q
+      salesRevenue12 += q * up
     }
 
-    // 4) Aggregate sales (qty, revenue, GP w/ historical cost), and per-product monthly
+    // 3) Names (avoid “Unknown”)
+    const namesQ = await supabaseService.from('products').select('id,name')
+    if (namesQ.error) return res.status(500).json({ error: namesQ.error.message })
+    const nameMap = new Map<string, string>(
+      ((namesQ.data ?? []) as NameRow[]).map(r => [String(r.id), String(r.name ?? '')])
+    )
+
+    // 4) Current inventory (for at-risk)
+    const invQ = await supabaseService.from('inventory_current').select('product_id,on_hand')
+    if (invQ.error) return res.status(500).json({ error: invQ.error.message })
+    const onHandMap = new Map<string, number>(
+      ((invQ.data ?? []) as InvRow[]).map(r => [String(r.product_id), Number(r.on_hand ?? 0)])
+    )
+
+    // 5) Build per-product monthly qty buckets (no cost/price join)
+    const monthIndex = new Map<string, number>() // "YYYY-MM-01" => 0..11
+    months.forEach((ym, idx) => monthIndex.set(ym, idx))
+
     const perProdMonthly = new Map<string, number[]>()
     const lastSaleDate = new Map<string, string>()
-    const qtyMap = new Map<string, number>()
-    const revenueMap = new Map<string, number>()
-    const gpMap = new Map<string, number>()
 
-    for (const s of sales) {
-      const pid = String(s.product_id)
-      const q = Number(s.quantity ?? 0)
-      const up = Number(s.unit_price ?? 0)
-      const d = String(s.date)
-
-      // totals
-      qtyMap.set(pid, (qtyMap.get(pid) ?? 0) + q)
-      revenueMap.set(pid, (revenueMap.get(pid) ?? 0) + q * up)
-
-      // historical GP
-      const uc = costAtDate(costTimeline.get(pid), d)
-      gpMap.set(pid, (gpMap.get(pid) ?? 0) + (up - uc) * q)
-
-      // monthly bucket
-      const mk = keyMonth(d)
-      const idx = idxMap.get(mk)
-      if (idx != null) {
-        const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
-        arr[idx] += q
+    for (const r of salesRows) {
+      const pid = String(r.product_id)
+      const key = monthKeyFromDateStr(String(r.date))
+      if (!monthIndex.has(key)) continue
+      const idx = monthIndex.get(key)!
+      let arr = perProdMonthly.get(pid)
+      if (!arr) {
+        arr = Array(12).fill(0)
         perProdMonthly.set(pid, arr)
       }
+      arr[idx] += Number(r.quantity ?? 0)
 
+      const d = String(r.date ?? '')
       const prev = lastSaleDate.get(pid)
       if (!prev || d > prev) lastSaleDate.set(pid, d)
     }
 
-    const totalQty12 = Array.from(qtyMap.values()).reduce((a, b) => a + b, 0)
-    const totalRev12 = Array.from(revenueMap.values()).reduce((a, b) => a + b, 0)
-
-    // 5) At-Risk (weighted MOQ) — top 20
+    // 6) At-Risk (weighted MOQ over last 12, compare to on_hand), return TOP 20 by gap
     type AtRiskRow = {
       product_id: string
       product_name: string
@@ -199,23 +111,25 @@ router.get('/dashboard/overview', async (_req, res) => {
       gap: number
       last_sale_date: string | null
     }
-    const atRisk: AtRiskRow[] = []
-    const productUniverse = new Set<string>([
+
+    const productIds = new Set<string>([
       ...Array.from(onHandMap.keys()),
       ...Array.from(perProdMonthly.keys())
     ])
 
-    for (const pid of productUniverse) {
+    const atRisk: AtRiskRow[] = []
+    for (const pid of productIds) {
       const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
       const weightedSum = arr.reduce((acc, qty, i) => acc + qty * weights12[i], 0)
-      const wavg = weightedSum / wSum12
-      const weighted_moq = Math.ceil(Math.max(0, wavg))
+      const weighted_moq = Math.ceil(wSum12 > 0 ? (weightedSum / wSum12) : 0)
+
       const onHand = onHandMap.get(pid) ?? 0
       const gap = Math.max(0, weighted_moq - onHand)
       if (gap > 0) {
+        const nm = nameMap.get(pid)
         atRisk.push({
           product_id: pid,
-          product_name: nameMap.get(pid) ?? '(unnamed)',
+          product_name: (nm && nm.trim().length > 0) ? nm : '(unnamed)',
           on_hand: onHand,
           weighted_moq,
           gap,
@@ -224,43 +138,37 @@ router.get('/dashboard/overview', async (_req, res) => {
       }
     }
     atRisk.sort((a, b) => b.gap - a.gap)
-    const atRiskTop = atRisk.slice(0, 20)
+    const atRiskTop20 = atRisk.slice(0, 20)
 
-    // 6) Top products — by gross profit (accurate, historical cost), keep 20
-    type TopRow = {
-      product_id: string
-      product_name: string
-      qty_12m: number
-      revenue_12m: number
-      gross_profit_12m: number
-    }
-    const top: TopRow[] = []
-    for (const pid of qtyMap.keys()) {
-      top.push({
-        product_id: pid,
-        product_name: nameMap.get(pid) ?? '(unnamed)',
-        qty_12m: qtyMap.get(pid) ?? 0,
-        revenue_12m: revenueMap.get(pid) ?? 0,
-        gross_profit_12m: gpMap.get(pid) ?? 0
-      })
-    }
-    top.sort((a, b) => b.gross_profit_12m - a.gross_profit_12m)
-    const topProducts = top.slice(0, 20)
+    // 7) Top products (from cache) – already accurate GP (historical cost at sale date)
+    const topRpc = await supabaseService.rpc('rpc_top_products_12m', { p_limit: 20 })
+    if (topRpc.error) return res.status(500).json({ error: topRpc.error.message })
+    const topProducts = (topRpc.data ?? []).map((r: any) => ({
+      product_id: String(r.product_id),
+      product_name: (() => {
+        const nm = nameMap.get(String(r.product_id))
+        return (nm && nm.trim().length > 0) ? nm : '(unnamed)'
+      })(),
+      qty_12m: Number(r.qty_12m ?? 0),
+      revenue_12m: Number(r.revenue_12m ?? 0),
+      gross_profit_12m: Number(r.gross_profit_12m ?? 0)
+    }))
 
+    // 8) Respond
     return res.json({
       totals: {
         products: productsCount,
         customers: customersCount,
-        sales_12m_qty: totalQty12,
-        sales_12m_revenue: totalRev12
+        sales_12m_qty: salesQty12,
+        sales_12m_revenue: salesRevenue12
       },
-      atRisk: atRiskTop,
+      atRisk: atRiskTop20,
       topProducts
     })
   } catch (e: any) {
     console.error('GET /dashboard/overview error:', {
-      message: String(e?.message || e),
-      details: String(e?.stack || e)
+      message: e?.message,
+      details: e?.stack || e
     })
     return res.status(500).json({ error: e?.message || 'Server error' })
   }
