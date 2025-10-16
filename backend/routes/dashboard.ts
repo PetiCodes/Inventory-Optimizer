@@ -47,7 +47,7 @@ router.get('/dashboard/overview', async (_req, res) => {
     const months = lastNMonthsUTC(12)
     const start12 = months[0]
 
-    /** 1) Totals (products, customers) – use head:true for fast count; fall back if needed */
+    /** 1) Totals */
     let productsCount = 0
     {
       const head = await supabaseService.from('products').select('id', { count: 'exact', head: true })
@@ -152,16 +152,15 @@ router.get('/dashboard/overview', async (_req, res) => {
       ...Array.from(aggQty.keys()),
     ])
 
-    /** 8) Fetch names only for those ids (avoid any “Unknown”) */
+    /** 8) Fetch names for those ids in batches */
     const nameMap = new Map<string, string>()
     if (productIds.size > 0) {
       const idList = Array.from(productIds)
-      // Chunk to avoid URL limits
       for (let i = 0; i < idList.length; i += 900) {
         const part = idList.slice(i, i + 900)
         const namesRes = await safeQ<{ id: string; name: string | null }[]>(
           supabaseService.from('products').select('id,name').in('id', part),
-          'products names'
+          `products names batch ${i / 900}`
         )
         if (Array.isArray(namesRes.data)) {
           for (const row of namesRes.data) {
@@ -172,7 +171,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       }
     }
 
-    /** 9) At-Risk list (weighted MOQ vs on hand) */
+    /** 9) Build At-Risk list */
     type AtRiskRow = {
       product_id: string
       product_name: string
@@ -205,9 +204,9 @@ router.get('/dashboard/overview', async (_req, res) => {
     }
 
     // Sort by gap desc and keep Top 20
-    const atRisk = atRiskAll.sort((a, b) => b.gap - a.gap).slice(0, 20)
+    let atRisk = atRiskAll.sort((a, b) => b.gap - a.gap).slice(0, 20)
 
-    /** 10) Top products (revenue/gp over last 12 months) */
+    /** 10) Top products */
     type TopRow = {
       product_id: string
       product_name: string
@@ -229,11 +228,30 @@ router.get('/dashboard/overview', async (_req, res) => {
         gross_profit_12m: grossProfit
       })
     }
-
     topCandidates.sort((a, b) => b.revenue_12m - a.revenue_12m)
-    const topProducts = topCandidates.slice(0, 20)
+    let topProducts = topCandidates.slice(0, 20)
 
-    /** 11) Respond */
+    /** 11) SECOND-CHANCE NAME FETCH (fixes “(unnamed product)” on UI) */
+    const missingForAtRisk = atRisk.map(r => r.product_id).filter(id => !nameMap.has(id))
+    const missingForTop = topProducts.map(r => r.product_id).filter(id => !nameMap.has(id))
+    const missing = Array.from(new Set([...missingForAtRisk, ...missingForTop]))
+    if (missing.length > 0) {
+      const missRes = await safeQ<{ id: string; name: string | null }[]>(
+        supabaseService.from('products').select('id,name').in('id', missing),
+        'products names (2nd pass)'
+      )
+      if (Array.isArray(missRes.data)) {
+        for (const row of missRes.data) {
+          const nm = String(row.name ?? '').trim()
+          if (nm) nameMap.set(String(row.id), nm)
+        }
+      }
+      // Apply updated names
+      atRisk = atRisk.map(r => ({ ...r, product_name: nameMap.get(r.product_id) ?? r.product_name }))
+      topProducts = topProducts.map(r => ({ ...r, product_name: nameMap.get(r.product_id) ?? r.product_name }))
+    }
+
+    /** 12) Respond */
     return res.json({
       totals: {
         products: productsCount,
@@ -246,7 +264,7 @@ router.get('/dashboard/overview', async (_req, res) => {
     })
   } catch (e: any) {
     console.error('GET /dashboard/overview fatal error:', e)
-    // Always return a valid shape so the UI doesn't break
+    // Return a valid shape so UI stays up
     return res.status(200).json({
       totals: { products: 0, customers: 0, sales_12m_qty: 0, sales_12m_revenue: 0 },
       atRisk: [],
