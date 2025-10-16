@@ -3,7 +3,7 @@ import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
-/** Helpers */
+/** ---------- helpers ---------- */
 const startOfMonthISO = (d: Date) =>
   `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`
 
@@ -25,36 +25,62 @@ function monthKeyFromDateStr(isoDate: string): string {
   return `${y}-${m}-01`
 }
 
-const weights12 = Array.from({ length: 12 }, (_, i) => i + 1) // 1..12
-const wSum12 = weights12.reduce((a, b) => a + b, 0) // 78
+const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
+const wSum12 = weights12.reduce((a, b) => a + b, 0)
+
+/** Safe wrapper: never throw, always return { data?: T; error?: string } */
+async function safe<T>(p: Promise<{ data: T | null; error: any }>, label: string) {
+  try {
+    const { data, error } = await p
+    if (error) {
+      console.error(`[dashboard] ${label} error:`, error)
+      return { data: null as T | null, error: String(error.message || error) }
+    }
+    return { data: (data ?? null) as T | null }
+  } catch (e: any) {
+    console.error(`[dashboard] ${label} exception:`, e)
+    return { data: null as T | null, error: String(e?.message || e) }
+  }
+}
 
 router.get('/dashboard/overview', async (_req, res) => {
   try {
-    // 1) Totals
-    const prodHead = await supabaseService.from('products').select('id', { count: 'exact', head: true })
-    if (prodHead.error) return res.status(500).json({ error: prodHead.error.message })
-    const productsCount = prodHead.count ?? 0
-
-    const custHead = await supabaseService.from('customers').select('id', { count: 'exact', head: true })
-    if (custHead.error) return res.status(500).json({ error: custHead.error.message })
-    const customersCount = custHead.count ?? 0
-
-    // 2) Last 12 months sales
-    const months = lastNMonthsUTC(12) // ascending list of YYYY-MM-01
+    const months = lastNMonthsUTC(12)
     const start12 = months[0] // inclusive
 
-    const sales12 = await supabaseService
-      .from('sales')
-      .select('product_id, date, quantity, unit_price')
-      .gte('date', start12)
+    /** 1) Totals (products, customers) */
+    let productsCount = 0
+    {
+      const r = await safe(supabaseService.from('products').select('id', { count: 'exact', head: true }), 'products count')
+      if (!r.error && (r as any).count !== undefined) {
+        // head:true doesn’t return data; supabase-js exposes count on response object,
+        // but safe() returns only data. Re-run as plain try/catch for count:
+        const head = await supabaseService.from('products').select('id', { count: 'exact', head: true })
+        if (!head.error) productsCount = head.count ?? 0
+      } else {
+        // fallback: non-head count
+        const all = await supabaseService.from('products').select('id', { count: 'exact' })
+        if (!all.error) productsCount = all.count ?? 0
+      }
+    }
 
-    if (sales12.error) return res.status(500).json({ error: sales12.error.message })
-    const salesRows = (sales12.data ?? []) as Array<{
-      product_id: string
-      date: string
-      quantity: number
-      unit_price: number | null
-    }>
+    let customersCount = 0
+    {
+      const head = await supabaseService.from('customers').select('id', { count: 'exact', head: true })
+      if (!head.error) customersCount = head.count ?? 0
+      else {
+        const all = await supabaseService.from('customers').select('id', { count: 'exact' })
+        if (!all.error) customersCount = all.count ?? 0
+      }
+    }
+
+    /** 2) Sales (last 12 months) */
+    type SaleRow = { product_id: string; date: string; quantity: number; unit_price: number | null }
+    const sales12 = await safe<SaleRow[]>(
+      supabaseService.from('sales').select('product_id, date, quantity, unit_price').gte('date', start12),
+      'sales last12'
+    )
+    const salesRows: SaleRow[] = Array.isArray(sales12.data) ? sales12.data : []
 
     let salesQty12 = 0
     let salesRevenue12 = 0
@@ -65,26 +91,33 @@ router.get('/dashboard/overview', async (_req, res) => {
       salesRevenue12 += q * up
     }
 
-    // 3) Current unit cost map
-    const costNow = await supabaseService
-      .from('v_product_current_price')
-      .select('product_id, unit_cost')
-    if (costNow.error) return res.status(500).json({ error: costNow.error.message })
-    const costMap = new Map<string, number>(
-      (costNow.data ?? []).map((r: any) => [String(r.product_id), Number(r.unit_cost ?? 0)])
+    /** 3) Current unit cost (view may not exist in some envs) */
+    type CostRow = { product_id: string; unit_cost: number | null }
+    const costNow = await safe<CostRow[]>(
+      supabaseService.from('v_product_current_price').select('product_id, unit_cost'),
+      'v_product_current_price'
     )
+    const costMap = new Map<string, number>()
+    if (Array.isArray(costNow.data)) {
+      for (const r of costNow.data) costMap.set(String(r.product_id), Number(r.unit_cost ?? 0))
+    } else {
+      // If view missing/blocked, we’ll just assume 0 cost so the route still succeeds
+      console.warn('[dashboard] v_product_current_price not available; gross_profit will assume unit_cost=0')
+    }
 
-    // 4) Current inventory (on hand)
-    const inv = await supabaseService
-      .from('inventory_current')
-      .select('product_id, on_hand')
-    if (inv.error) return res.status(500).json({ error: inv.error.message })
-    const onHandMap = new Map<string, number>(
-      (inv.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)])
+    /** 4) Inventory on hand */
+    type InvRow = { product_id: string; on_hand: number | null }
+    const inv = await safe<InvRow[]>(
+      supabaseService.from('inventory_current').select('product_id, on_hand'),
+      'inventory_current'
     )
+    const onHandMap = new Map<string, number>()
+    if (Array.isArray(inv.data)) {
+      for (const r of inv.data) onHandMap.set(String(r.product_id), Number(r.on_hand ?? 0))
+    }
 
-    // 5) Build per-product monthly buckets for last 12 months
-    const monthIndex = new Map<string, number>() // "YYYY-MM-01" => 0..11
+    /** 5) Per-product monthly buckets & last sale date */
+    const monthIndex = new Map<string, number>()
     months.forEach((ym, idx) => monthIndex.set(ym, idx))
 
     const perProdMonthly = new Map<string, number[]>() // product_id -> qty[12]
@@ -103,13 +136,12 @@ router.get('/dashboard/overview', async (_req, res) => {
       }
       arr[idx] += Number(r.quantity ?? 0)
 
-      // track last sale
       const d = String(r.date ?? '')
       const prev = lastSaleDate.get(pid)
       if (!prev || d > prev) lastSaleDate.set(pid, d)
     }
 
-    // 6) Aggregate qty & revenue for top-products
+    /** 6) Aggregates for top-products */
     const aggQty = new Map<string, number>()
     const aggRevenue = new Map<string, number>()
     for (const r of salesRows) {
@@ -120,34 +152,36 @@ router.get('/dashboard/overview', async (_req, res) => {
       aggRevenue.set(pid, (aggRevenue.get(pid) ?? 0) + q * up)
     }
 
-    // 7) Collect product ids actually used (sales or inventory)
+    /** 7) Product ids actually used (sales or inventory) */
     const productIds = new Set<string>([
       ...Array.from(onHandMap.keys()),
       ...Array.from(perProdMonthly.keys()),
       ...Array.from(aggQty.keys()),
     ])
 
-    // Fetch only those product names to avoid any mismatch
-    let nameMap = new Map<string, string>()
+    /** 8) Fetch names only for those ids (avoid any “Unknown”) */
+    const nameMap = new Map<string, string>()
     if (productIds.size > 0) {
       const idList = Array.from(productIds)
       const chunks: string[][] = []
-      for (let i = 0; i < idList.length; i += 1000) chunks.push(idList.slice(i, i + 1000))
+      for (let i = 0; i < idList.length; i += 900) chunks.push(idList.slice(i, i + 900)) // stay below URL limits
 
-      const temp = new Map<string, string>()
       for (const part of chunks) {
-        const namesRes = await supabaseService.from('products').select('id,name').in('id', part)
-        if (namesRes.error) return res.status(500).json({ error: namesRes.error.message })
-        for (const row of namesRes.data ?? []) {
-          const nm = String(row.name ?? '').trim()
-          temp.set(String(row.id), nm || '(unnamed product)')
+        const namesRes = await safe<{ id: string; name: string | null }[]>(
+          supabaseService.from('products').select('id,name').in('id', part),
+          'products names'
+        )
+        if (Array.isArray(namesRes.data)) {
+          for (const row of namesRes.data) {
+            const nm = String(row.name ?? '').trim()
+            nameMap.set(String(row.id), nm || '(unnamed product)')
+          }
         }
       }
-      nameMap = temp
     }
 
-    // 8) Build at-risk list (weighted MOQ vs on hand)
-    type AtRisk = {
+    /** 9) At-Risk list (weighted MOQ vs on hand) */
+    type AtRiskRow = {
       product_id: string
       product_name: string
       on_hand: number
@@ -155,7 +189,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       gap: number
       last_sale_date: string | null
     }
-    const atRiskAll: AtRisk[] = []
+    const atRiskAll: AtRiskRow[] = []
 
     for (const pid of productIds) {
       const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
@@ -178,10 +212,10 @@ router.get('/dashboard/overview', async (_req, res) => {
       }
     }
 
-    // Sort by gap and cap to top 20
+    // Sort by gap desc and keep Top 20
     const atRisk = atRiskAll.sort((a, b) => b.gap - a.gap).slice(0, 20)
 
-    // 9) Top products (revenue/gp over last 12)
+    /** 10) Top products (revenue/gp over last 12 months) */
     type TopRow = {
       product_id: string
       product_name: string
@@ -189,7 +223,6 @@ router.get('/dashboard/overview', async (_req, res) => {
       revenue_12m: number
       gross_profit_12m: number
     }
-
     const topCandidates: TopRow[] = []
     for (const [pid, qty] of aggQty.entries()) {
       const revenue = aggRevenue.get(pid) ?? 0
@@ -208,7 +241,7 @@ router.get('/dashboard/overview', async (_req, res) => {
     topCandidates.sort((a, b) => b.revenue_12m - a.revenue_12m)
     const topProducts = topCandidates.slice(0, 20)
 
-    // 10) Respond
+    /** 11) Respond */
     return res.json({
       totals: {
         products: productsCount,
@@ -220,8 +253,14 @@ router.get('/dashboard/overview', async (_req, res) => {
       topProducts
     })
   } catch (e: any) {
-    console.error('GET /dashboard/overview error:', e)
-    return res.status(500).json({ error: e?.message || 'Server error' })
+    console.error('GET /dashboard/overview fatal error:', e)
+    // Still return a valid payload shape so the UI doesn't break
+    return res.status(200).json({
+      totals: { products: 0, customers: 0, sales_12m_qty: 0, sales_12m_revenue: 0 },
+      atRisk: [],
+      topProducts: [],
+      warning: 'Partial/empty data due to server error'
+    })
   }
 })
 
