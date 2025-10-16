@@ -142,7 +142,7 @@ export default function Dashboard() {
                           <TableHead className="w-10">#</TableHead>
                           <TableHead className="min-w-[200px]">Product</TableHead>
                           <TableHead className="text-right">On&nbsp;Hand</TableHead>
-                          <TableHead className="text-right">Weighted&nbsp;MOQ</TableHead>
+                          <TableHead className="text-right">MOQ</TableHead>
                           <TableHead className="text-right">Gap</TableHead>
                           <TableHead className="text-right w-28">Actions</TableHead>
                         </TableRow>
