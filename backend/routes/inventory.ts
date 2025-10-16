@@ -1,3 +1,4 @@
+// backend/routes/inventory.ts
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
@@ -211,7 +212,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
         unit_cost: Number(r.unit_cost) || 0,
         unit_price: Number(r.unit_price) || 0
       })
-      // inventory_current has no as_of_date – only product_id (PK), on_hand, backorder
+      // inventory_current: single current row per product_id
       invPayload.push({
         product_id: pid,
         on_hand: Number(r.on_hand) || 0,
@@ -219,8 +220,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Dedupe by unique keys:
-    // product_prices => (product_id, effective_date)
+    // dedupe by unique keys
     const uniqPrice = Array.from(
       pricePayload
         .reduce(
@@ -229,11 +229,10 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
         )
         .values()
     )
-    // inventory_current => product_id
     const uniqInv = Array.from(
       invPayload
         .reduce(
-          (m, row) => m.set(row.product_id, row), // last one wins
+          (m, row) => m.set(row.product_id, row),
           new Map<string, InvRow>()
         )
         .values()
@@ -252,7 +251,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       priceInserted += part.length
     }
 
-    // upsert inventory_current (conflict on single-column PK)
+    // upsert inventory_current (conflict on product_id)
     let invInserted = 0
     for (const part of chunk(uniqInv, 500)) {
       const ins2 = await supabaseService
@@ -263,6 +262,14 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
         return res.status(500).json({ error: ins2.error.message })
       }
       invInserted += part.length
+    }
+
+    // Refresh cached KPIs (non-fatal)
+    try {
+      const asOf = new Date().toISOString().slice(0, 10)
+      await supabaseService.rpc('rpc_product_kpis_refresh_12m', { p_as_of: asOf })
+    } catch (e) {
+      console.warn('KPI refresh post-inventory-upload failed (will refresh nightly):', e)
     }
 
     return res.json({
