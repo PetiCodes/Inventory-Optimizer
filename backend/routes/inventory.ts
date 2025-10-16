@@ -12,7 +12,7 @@ const upload = multer({
 
 /** ───────────────────────── Helpers ───────────────────────── **/
 
-// Safe string coercion (never call global String())
+// Safe string coercion (avoid calling global String() as a function)
 const s = (v: any) => `${v ?? ''}`
 
 // Normalize for case-insensitive lookups
@@ -24,6 +24,7 @@ const norm = (v: any) =>
     .replace(/\s+/g, ' ')
 
 // Remove leading "[...]" code, then trim.
+// Example: "[40717] AURA POUCH" → "AURA POUCH"
 const stripLeadingTag = (v: any) => s(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
 
 // Number parser tolerant to "1,234", "1 234", "1.234,56", etc.
@@ -36,7 +37,7 @@ function parseNumber(input: any): number | null {
     t = t.replace(/\./g, '')  // thousands
     t = t.replace(',', '.')   // decimal
   } else {
-    t = t.replace(/[, ]/g, '') // remove separators
+    t = t.replace(/[, ]/g, '') // remove thousands/space
   }
   const n = Number(t)
   return Number.isFinite(n) ? n : null
@@ -166,10 +167,8 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const allProds = await supabaseService.from('products').select('id,name')
     if (allProds.error) return res.status(500).json({ error: allProds.error.message })
 
-    // exact name map
-    const exactMap = new Map<string, string>()  // normalized exact name → id
-    // stripped tag map
-    const strippedMap = new Map<string, string>() // normalized stripped name → id
+    const exactMap = new Map<string, string>()     // normalized exact name → id
+    const strippedMap = new Map<string, string>()  // normalized stripped name → id
 
     for (const p of (allProds.data ?? [])) {
       const id = s(p.id)
@@ -190,14 +189,10 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       const strippedKey = norm(stripLeadingTag(incoming))
 
       let product_id = exactMap.get(exactKey)
+      if (!product_id) product_id = strippedMap.get(strippedKey)
+
       let matched_name: string | undefined
-
-      if (!product_id) {
-        product_id = strippedMap.get(strippedKey)
-      }
-
       if (product_id) {
-        // stash display name if we have it (find once)
         const found = (allProds.data ?? []).find((p: any) => s(p.id) === product_id)
         matched_name = s(found?.name ?? incoming)
       }
@@ -221,7 +216,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     const todayISO = new Date().toISOString().slice(0, 10)
 
-    // Build payloads
+    /** Build payloads **/
     type PriceRow = {
       product_id: string
       effective_date: string
@@ -231,8 +226,8 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     }
     type InvRow = {
       product_id: string
-      as_of_date: string
       on_hand: number
+      backorder?: number | null
       source?: string
     }
 
@@ -243,49 +238,55 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       const pid = s(r.product_id)
       pricePayload.push({
         product_id: pid,
-        effective_date: todayISO,
+        effective_date: todayISO,                    // history (per-day)
         unit_cost: Number(r.unit_cost) || 0,
         unit_price: Number(r.unit_price) || 0,
-        source: 'inventory'
+        source: 'inventory_upload'
       })
       invPayload.push({
         product_id: pid,
-        as_of_date: todayISO,
-        on_hand: Number(r.on_hand) || 0,
-        source: 'inventory'
+        on_hand: Number(r.on_hand) || 0,             // current level snapshot
+        backorder: 0,
+        source: 'inventory_upload'
       })
     }
 
-    // Insert in chunks; onConflict ensures one row per day per product
+    /** Insert in chunks **/
+
+    // 1) product_prices: conflict on (product_id, effective_date)
     let priceInserted = 0
     for (const part of chunk(pricePayload, 500)) {
       const ins = await supabaseService
         .from('product_prices')
         .upsert(part, { onConflict: 'product_id,effective_date' })
+
       if (ins.error) {
         console.error('product_prices upsert error:', ins.error)
         return res.status(500).json({ error: ins.error.message })
       }
-      priceInserted += (ins.count as number) ?? part.length
+      // supabase upsert often doesn't return count; fall back to batch size
+      priceInserted += (ins.count ?? part.length)
     }
 
-    let invInserted = 0
+    // 2) inventory_current: one row per product
+    let invUpserts = 0
     for (const part of chunk(invPayload, 500)) {
       const ins2 = await supabaseService
-        .from('inventory_levels')
-        .upsert(part, { onConflict: 'product_id,as_of_date' })
+        .from('inventory_current')
+        .upsert(part, { onConflict: 'product_id' })
+
       if (ins2.error) {
-        console.error('inventory_levels upsert error:', ins2.error)
+        console.error('inventory_current upsert error:', ins2.error)
         return res.status(500).json({ error: ins2.error.message })
       }
-      invInserted += (ins2.count as number) ?? part.length
+      invUpserts += (ins2.count ?? part.length)
     }
 
     // Done
     return res.json({
       matched_products: resolved.length,
       price_rows: priceInserted,
-      inventory_rows: invInserted,
+      inventory_rows: invUpserts,
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
       sampleRejected: rejected.slice(0, 50)
