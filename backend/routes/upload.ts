@@ -1,18 +1,18 @@
-// backend/routes/upload.ts
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
-import { supabaseService } from '../src/supabase.js' // <- keep the .js suffix for NodeNext builds
+import { supabaseService } from '../src/supabase.js' // keep .js for NodeNext
 
 const router = Router()
 
-// 15 MB limit is usually plenty for Excel; adjust if needed
+// ~30MB is generous for spreadsheet uploads
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 }
 })
 
-// ─────────────────────────── Helpers ───────────────────────────
+/* -------------------------- helpers -------------------------- */
+
 const REQUIRED = ['date', 'customer name', 'product', 'quantity'] as const
 const OPTIONAL_PRICE = 'price'
 
@@ -62,7 +62,7 @@ function excelSerialToISO(serial: number): string | null {
 function tryParseDateString(s: string): string | null {
   const t = s.trim()
   if (!t) return null
-  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t // fast path (YYYY-MM-DD)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t // YYYY-MM-DD
   const d = new Date(t)
   if (!isNaN(d.getTime())) {
     const yyyy = d.getFullYear()
@@ -88,12 +88,13 @@ async function selectByNames(
   return out
 }
 
-// ─────────────────────────── Route ───────────────────────────
+/* --------------------------- route --------------------------- */
+
 router.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'File is required (field name must be "file")' })
 
-    // Parse workbook
+    // Parse workbook → first sheet
     let ws
     try {
       const wb = xlsx.read(req.file.buffer, { type: 'buffer' })
@@ -105,17 +106,16 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Unable to parse file. Use .xlsx/.xls/.csv with headers.' })
     }
 
-    // Read as AOA so we can map headers flexibly
+    // AOA for flexible header mapping
     const aoa: any[][] = xlsx.utils.sheet_to_json(ws, { header: 1, raw: false })
     if (!aoa?.length) return res.status(400).json({ error: 'No data found in sheet' })
 
     const headerRow = (aoa[0] ?? []).map(h => String(h ?? ''))
-
     const toKey = (s: string) => s.trim().toLowerCase().replace(/\s+/g, ' ')
     const idx: Record<string, number> = {}
     headerRow.forEach((h, i) => { idx[toKey(h)] = i })
 
-    // Check required
+    // Validate headers
     const missing = REQUIRED.filter(k => idx[k] === undefined)
     if (missing.length) {
       return res.status(400).json({
@@ -125,7 +125,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     }
     const hasPrice = idx[OPTIONAL_PRICE] !== undefined
 
-    // Body rows (skip fully empty)
+    // Non-empty body rows
     const body = aoa
       .slice(1)
       .filter(r => r && r.some((c: any) => c !== null && c !== undefined && String(c).trim() !== ''))
@@ -140,7 +140,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       reasonCounts.set(reason, (reasonCounts.get(reason) || 0) + 1)
     }
 
-    // Forward-fill Date & Customer as per your original rule
+    // Forward-fill Date & Customer
     let lastCustomer: string | null = null
     let lastDateISO: string | null = null
 
@@ -152,12 +152,12 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       const rawQty  = r[idx['quantity']]
       const rawPrice = hasPrice ? r[idx[OPTIONAL_PRICE]] : undefined
 
-      // Customer forward fill
+      // Customer forward-fill
       let customer = String(rawCust ?? '').trim()
       if (customer) lastCustomer = customer
       else if (lastCustomer) customer = lastCustomer
 
-      // Date forward fill
+      // Date forward-fill / parse
       let dateISO: string | null = null
       if (rawDate === null || rawDate === undefined || String(rawDate).trim() === '') {
         dateISO = lastDateISO
@@ -177,7 +177,6 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       if (!product)        return reject(rowNum, 'Missing Product')
       if (qtyNum === null) return reject(rowNum, 'Invalid Quantity')
       if (qtyNum < 0)      return reject(rowNum, 'Negative Quantity')
-      // price is optional; if present but invalid we’ll just ignore it
 
       clean.push({ Date: dateISO, 'Customer Name': customer, Product: product, Quantity: qtyNum, Price: priceNum })
     })
@@ -244,7 +243,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Insert in batches (avoid timeouts)
+    // Insert in batches
     const batches = chunk(salesPayload, 250)
     let inserted = 0
     for (const b of batches) {
@@ -254,6 +253,14 @@ router.post('/upload', upload.single('file'), async (req, res) => {
         return res.status(500).json({ error: ins.error.message, inserted })
       }
       inserted += ins.count ?? b.length
+    }
+
+    // Refresh cached KPIs (non-fatal if it fails)
+    try {
+      const asOf = new Date().toISOString().slice(0, 10)
+      await supabaseService.rpc('rpc_product_kpis_refresh_12m', { p_as_of: asOf })
+    } catch (e) {
+      console.warn('KPI refresh post-sales-upload failed (will refresh nightly):', e)
     }
 
     return res.json({
