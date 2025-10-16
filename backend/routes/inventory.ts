@@ -93,9 +93,9 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     const idxMap: Record<typeof REQUIRED[number], number> = {
       'name': -1,
-      'sales price (current)': -1,
+      'sales price': -1,
       'cost': -1,
-      'quantity on hand (stocks)': -1
+      'quantity on hand': -1
     }
 
     headerRow.forEach((h: any, i: number) => {
@@ -136,9 +136,9 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     rows.forEach((r: any[], i: number) => {
       const rowNum = i + 2
       const name = s(r[idxMap['name']]).trim()
-      const price = parseNumber(r[idxMap['sales price (current)']])
+      const price = parseNumber(r[idxMap['sales price']])
       const cost  = parseNumber(r[idxMap['cost']])
-      const onH   = parseNumber(r[idxMap['quantity on hand (stocks)']])
+      const onH   = parseNumber(r[idxMap['quantity on hand']])
 
       if (!name) return reject(rowNum, 'Missing Name')
       if (price === null) return reject(rowNum, 'Invalid Sales Price')
