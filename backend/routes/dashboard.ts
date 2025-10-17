@@ -3,36 +3,51 @@ import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
-/** Helpers */
-const startOfMonthISO = (d: Date) =>
-  `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`
-
-function lastNMonthsUTC(n: number): string[] {
-  const now = new Date()
-  const arr: string[] = []
-  for (let i = n - 1; i >= 0; i--) {
-    const dt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1))
-    arr.push(startOfMonthISO(dt))
-  }
-  return arr
+/** ───────────── Date helpers (UTC, month-aligned) ───────────── */
+function monthStartUTC(y: number, m0: number) {
+  return new Date(Date.UTC(y, m0, 1))
 }
-function monthKeyFromDateStr(isoDate: string): string {
-  if (!isoDate || isoDate.length < 7) return ''
+function monthEndUTC(y: number, m0: number) {
+  // day 0 of next month == last day of this month
+  return new Date(Date.UTC(y, m0 + 1, 0))
+}
+function last12WindowUTC() {
+  const now = new Date()
+  const endMonthStart = monthStartUTC(now.getUTCFullYear(), now.getUTCMonth())
+  const startMonthStart = monthStartUTC(endMonthStart.getUTCFullYear(), endMonthStart.getUTCMonth() - 11)
+  const endMonthEnd = monthEndUTC(endMonthStart.getUTCFullYear(), endMonthStart.getUTCMonth())
+  return {
+    startISO: startMonthStart.toISOString().slice(0, 10), // inclusive
+    endISO: endMonthEnd.toISOString().slice(0, 10)        // inclusive
+  }
+}
+const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
+const wSum12 = weights12.reduce((a, b) => a + b, 0)
+
+/** Build an ascending list of YYYY-MM-01 keys for last 12 months */
+function last12MonthsKeys(): string[] {
+  const now = new Date()
+  const anchor = monthStartUTC(now.getUTCFullYear(), now.getUTCMonth())
+  const out: string[] = []
+  for (let i = 11; i >= 0; i--) {
+    const d = monthStartUTC(anchor.getUTCFullYear(), anchor.getUTCMonth() - i)
+    out.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`)
+  }
+  return out
+}
+function monthKeyFrom(isoDate: string): string {
   const y = isoDate.slice(0, 4)
   const m = isoDate.slice(5, 7)
   return `${y}-${m}-01`
 }
 
-const weights12 = Array.from({ length: 12 }, (_, i) => i + 1) // 1..12
-const wSum12 = weights12.reduce((a, b) => a + b, 0) // 78
-
+/** Types (light) */
 type SaleRow = { product_id: string; date: string; quantity: number; unit_price: number | null }
-type NameRow = { id: string; name: string | null }
 type InvRow  = { product_id: string; on_hand: number | null }
 
 router.get('/dashboard/overview', async (_req, res) => {
   try {
-    // 1) Totals
+    /** 1) Totals: products, customers */
     const prodHead = await supabaseService.from('products').select('id', { count: 'exact', head: true })
     if (prodHead.error) return res.status(500).json({ error: prodHead.error.message })
     const productsCount = prodHead.count ?? 0
@@ -41,119 +56,108 @@ router.get('/dashboard/overview', async (_req, res) => {
     if (custHead.error) return res.status(500).json({ error: custHead.error.message })
     const customersCount = custHead.count ?? 0
 
-    // 2) Last 12 months basic totals (qty/revenue)
-    const months = lastNMonthsUTC(12)
-    const start12 = months[0]
+    /** 2) Last 12 months sales (exact month-aligned window, inclusive) */
+    const { startISO, endISO } = last12WindowUTC()
 
-    const s12 = await supabaseService
+    const sQ = await supabaseService
       .from('sales')
       .select('product_id, date, quantity, unit_price')
-      .gte('date', start12)
+      .gte('date', startISO)
+      .lte('date', endISO)
 
-    if (s12.error) return res.status(500).json({ error: s12.error.message })
-    const salesRows = (s12.data ?? []) as SaleRow[]
+    if (sQ.error) return res.status(500).json({ error: sQ.error.message })
+    const sales = (sQ.data ?? []) as SaleRow[]
 
     let salesQty12 = 0
     let salesRevenue12 = 0
-    for (const r of salesRows) {
-      const q  = Number(r.quantity ?? 0)
+    for (const r of sales) {
+      const q = Number(r.quantity ?? 0)
       const up = Number(r.unit_price ?? 0)
       salesQty12 += q
       salesRevenue12 += q * up
     }
 
-    // 3) Names (avoid “Unknown”)
-    const namesQ = await supabaseService.from('products').select('id,name')
-    if (namesQ.error) return res.status(500).json({ error: namesQ.error.message })
-    const nameMap = new Map<string, string>(
-      ((namesQ.data ?? []) as NameRow[]).map(r => [String(r.id), String(r.name ?? '')])
-    )
+    /** 3) At-Risk of stockout (weighted MOQ over last 12, compare inventory_current.on_hand) */
+    // Month buckets for last 12
+    const keys = last12MonthsKeys()
+    const idx = new Map<string, number>()
+    keys.forEach((k, i) => idx.set(k, i))
 
-    // 4) Current inventory (for at-risk)
-    const invQ = await supabaseService.from('inventory_current').select('product_id,on_hand')
-    if (invQ.error) return res.status(500).json({ error: invQ.error.message })
-    const onHandMap = new Map<string, number>(
-      ((invQ.data ?? []) as InvRow[]).map(r => [String(r.product_id), Number(r.on_hand ?? 0)])
-    )
-
-    // 5) Build per-product monthly qty buckets
-    const monthIndex = new Map<string, number>() // "YYYY-MM-01" => 0..11
-    months.forEach((ym, idx) => monthIndex.set(ym, idx))
-
-    const perProdMonthly = new Map<string, number[]>()
-    const lastSaleDate = new Map<string, string>()
-
-    for (const r of salesRows) {
+    const perProd = new Map<string, number[]>(/* pid -> [12] */)
+    for (const r of sales) {
+      const k = monthKeyFrom(String(r.date))
+      const i = idx.get(k)
+      if (i === undefined) continue
       const pid = String(r.product_id)
-      const key = monthKeyFromDateStr(String(r.date))
-      if (!monthIndex.has(key)) continue
-      const idx = monthIndex.get(key)!
-      let arr = perProdMonthly.get(pid)
-      if (!arr) {
-        arr = Array(12).fill(0)
-        perProdMonthly.set(pid, arr)
-      }
-      arr[idx] += Number(r.quantity ?? 0)
-
-      const d = String(r.date ?? '')
-      const prev = lastSaleDate.get(pid)
-      if (!prev || d > prev) lastSaleDate.set(pid, d)
+      const arr = perProd.get(pid) ?? Array(12).fill(0)
+      arr[i] += Number(r.quantity ?? 0)
+      perProd.set(pid, arr)
     }
 
-    // 6) At-Risk (weighted MOQ over last 12, compare to on_hand) — TOP 20 by gap
+    // Inventory
+    const invQ = await supabaseService.from('inventory_current').select('product_id,on_hand')
+    if (invQ.error) return res.status(500).json({ error: invQ.error.message })
+    const onHandMap = new Map<string, number>((invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)]))
+
+    // PIDs we care about (union of sales & inventory)
+    const pidSet = new Set<string>([...perProd.keys(), ...onHandMap.keys()])
+    const pidList = Array.from(pidSet)
+
+    // Fetch names ONLY for these products to avoid “(unnamed)”
+    let nameMap = new Map<string, string>()
+    if (pidList.length) {
+      const nameRes = await supabaseService.from('products').select('id,name').in('id', pidList)
+      if (nameRes.error) return res.status(500).json({ error: nameRes.error.message })
+      nameMap = new Map((nameRes.data ?? []).map((p: any) => [String(p.id), String(p.name ?? '')]))
+    }
+
     type AtRiskRow = {
       product_id: string
       product_name: string
       on_hand: number
       weighted_moq: number
       gap: number
-      last_sale_date: string | null
     }
-
-    const productIds = new Set<string>([
-      ...Array.from(onHandMap.keys()),
-      ...Array.from(perProdMonthly.keys())
-    ])
-
     const atRisk: AtRiskRow[] = []
-    for (const pid of productIds) {
-      const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
-      const weightedSum = arr.reduce((acc, qty, i) => acc + qty * weights12[i], 0)
-      const weighted_moq = Math.ceil(wSum12 > 0 ? (weightedSum / wSum12) : 0)
-
+    for (const pid of pidList) {
+      const arr = perProd.get(pid) ?? Array(12).fill(0)
+      const weightedSum = arr.reduce((acc, q, i) => acc + q * weights12[i], 0)
+      const weighted_moq = Math.ceil(wSum12 ? weightedSum / wSum12 : 0)
       const onHand = onHandMap.get(pid) ?? 0
       const gap = Math.max(0, weighted_moq - onHand)
       if (gap > 0) {
-        const nm = nameMap.get(pid)
+        const nm = (nameMap.get(pid) || '').trim()
         atRisk.push({
           product_id: pid,
-          product_name: (nm && nm.trim().length > 0) ? nm : '(unnamed)',
+          product_name: nm || '(unknown product)',
           on_hand: onHand,
           weighted_moq,
-          gap,
-          last_sale_date: lastSaleDate.get(pid) ?? null
+          gap
         })
       }
     }
     atRisk.sort((a, b) => b.gap - a.gap)
     const atRiskTop20 = atRisk.slice(0, 20)
 
-    // 7) Top products — use the cached accurate 12m GP and rank by gross_profit_12m
-    // You created the RPC earlier; it reads v_product_profit_cache and orders by GP desc.
-    const topRpc = await supabaseService.rpc('rpc_top_products_12m', { p_limit: 20 })
-    if (topRpc.error) return res.status(500).json({ error: topRpc.error.message })
-    const topProducts = (topRpc.data ?? []).map((r: any) => ({
+    /** 4) Top products (12M) from the cache view — already accurate GP */
+    // Prefer the view with name pre-joined, but gracefully fall back if not present.
+    const topQ = await supabaseService
+      .from('v_product_profit_cache')
+      .select('product_id, product_name, qty_12m, revenue_12m, gross_profit_12m')
+      .order('gross_profit_12m', { ascending: false })
+      .limit(20)
+
+    if (topQ.error) return res.status(500).json({ error: topQ.error.message })
+
+    const topProducts = (topQ.data ?? []).map((r: any) => ({
       product_id: String(r.product_id),
-      product_name: (() => {
-        const nm = nameMap.get(String(r.product_id))
-        return (nm && nm.trim().length > 0) ? nm : '(unnamed)'
-      })(),
+      product_name: String(r.product_name ?? '').trim() || (nameMap.get(String(r.product_id)) ?? '(unknown product)'),
       qty_12m: Number(r.qty_12m ?? 0),
       revenue_12m: Number(r.revenue_12m ?? 0),
       gross_profit_12m: Number(r.gross_profit_12m ?? 0)
     }))
 
-    // 8) Respond
+    /** 5) Respond */
     return res.json({
       totals: {
         products: productsCount,
@@ -165,10 +169,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       topProducts
     })
   } catch (e: any) {
-    console.error('GET /dashboard/overview error:', {
-      message: e?.message,
-      details: e?.stack || e
-    })
+    console.error('GET /dashboard/overview error:', e)
     return res.status(500).json({ error: e?.message || 'Server error' })
   }
 })
