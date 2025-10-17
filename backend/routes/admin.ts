@@ -4,26 +4,41 @@ import { supabaseService } from '../src/supabase.js'
 const router = Router()
 
 /**
- * POST /api/refresh-gross-profit
- * Rebuilds the 12-month profit cache using accurate “cost at/before sale date”.
- * Optional JSON body: { asOf: 'YYYY-MM-DD' }  // defaults to today (server time)
+ * Triggers the SQL function refresh_product_profit_cache() you created.
+ * We expose TWO paths so either will work:
+ *   POST /api/admin/refresh-gross-profit   (preferred)
+ *   POST /api/refresh-gross-profit         (legacy/backup)
  */
-router.post('/refresh-gross-profit', async (req, res) => {
+async function handleRefresh(_req: any, res: any) {
   try {
-    const asOf =
-      (typeof req.body?.asOf === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.body.asOf))
-        ? req.body.asOf
-        : new Date().toISOString().slice(0, 10)
+    // (Optional) get a count to return something meaningful
+    const before = await supabaseService
+      .from('product_profit_cache')
+      .select('product_id', { count: 'exact', head: true })
 
-    // Call the SQL function you installed earlier
-    const { error } = await supabaseService.rpc('refresh_product_profit_cache', { p_asof: asOf })
-    if (error) return res.status(500).json({ error: error.message })
+    if (before.error && before.error.code !== 'PGRST116') {
+      // PGRST116 = relation not found; ignore so we can still run the function which will create/replace rows
+      return res.status(500).json({ error: before.error.message })
+    }
 
-    return res.json({ ok: true, asOf })
+    const rpc = await supabaseService.rpc('refresh_product_profit_cache', {})
+    if (rpc.error) {
+      return res.status(500).json({ error: rpc.error.message })
+    }
+
+    const after = await supabaseService
+      .from('product_profit_cache')
+      .select('product_id', { count: 'exact', head: true })
+
+    const rows = after.count ?? null
+    return res.json({ ok: true, rows })
   } catch (e: any) {
-    console.error('POST /api/refresh-gross-profit error:', e)
-    return res.status(500).json({ error: e?.message || 'Server error' })
+    console.error('refresh-gross-profit error:', e)
+    return res.status(500).json({ error: e?.message || 'Refresh failed' })
   }
-})
+}
+
+router.post('/admin/refresh-gross-profit', handleRefresh) // preferred
+router.post('/refresh-gross-profit', handleRefresh)       // alias
 
 export default router
