@@ -3,13 +3,12 @@ import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
-/** Date helpers (UTC, month-aligned) */
+/* -------------------- date helpers (UTC, month-aligned) -------------------- */
 function monthStartUTC(y: number, m0: number) {
   return new Date(Date.UTC(y, m0, 1))
 }
 function monthEndUTC(y: number, m0: number) {
-  // day 0 of next month == last day of this month
-  return new Date(Date.UTC(y, m0 + 1, 0))
+  return new Date(Date.UTC(y, m0 + 1, 0)) // day 0 of next month == last day of this month
 }
 function ymKeyUTC(d: Date): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
@@ -38,6 +37,32 @@ function stddev(nums: number[]): number {
 }
 const ORDER_COVERAGE_MONTHS = 4
 
+/* ------------------------------ SEARCH ROUTE ------------------------------ */
+/**
+ * GET /api/products/search?q=...&limit=20
+ * Used by your Products list page. Returns id & name.
+ */
+router.get('/products/search', async (req, res) => {
+  try {
+    const q = String(req.query.q ?? '').trim()
+    const limit = Math.max(1, Math.min(Number(req.query.limit ?? 50), 200))
+    let query = supabaseService
+      .from('products')
+      .select('id,name')
+      .order('name', { ascending: true })
+      .limit(limit)
+
+    if (q) query = query.ilike('name', `%${q}%`)
+
+    const { data, error } = await query
+    if (error) return res.status(500).json({ error: error.message })
+    return res.json({ results: data ?? [] })
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'Server error' })
+  }
+})
+
+/* --------------------------- PRODUCT OVERVIEW --------------------------- */
 /**
  * GET /api/products/:id/overview
  *  Query:
@@ -53,7 +78,11 @@ router.get('/products/:id/overview', async (req, res) => {
     const top = Math.max(1, Math.min(Number(req.query.top ?? 5), 5))
 
     // Product header
-    const prod = await supabaseService.from('products').select('id,name').eq('id', productId).single()
+    const prod = await supabaseService
+      .from('products')
+      .select('id,name')
+      .eq('id', productId)
+      .single()
     if (prod.error || !prod.data) return res.status(404).json({ error: 'Product not found' })
 
     // Build the time window + X-axis scaffold for the chart
@@ -103,13 +132,14 @@ router.get('/products/:id/overview', async (req, res) => {
       cost: Number(p.unit_cost ?? 0)
     }))
 
-    // Scan: for each sale date, use last price.effective_date <= sale.date
-    let pi = 0
-    let currentCost = pricePoints.length ? pricePoints[0].cost : 0
+    // FIX: do NOT default to the first cost (it may be after the sale date).
+    // Use latest cost with effective_date <= sale.date; if none, use 0.
+    let pi = -1 // points to the last price with eff <= current sale date
+    let currentCost = 0
     const gpAccumulator = { qty: 0, revenue: 0, cost: 0 }
 
     for (const s of sales) {
-      // advance cost pointer to latest <= sale date
+      // advance pointer while the next price takes effect on/before the sale date
       while (pi + 1 < pricePoints.length && pricePoints[pi + 1].eff <= s.date) {
         pi++
         currentCost = pricePoints[pi].cost
@@ -137,7 +167,7 @@ router.get('/products/:id/overview', async (req, res) => {
       qty: monthMap.get(s.key) ?? 0
     }))
 
-    // 4) stats12: ALWAYS do last 12 months ending this month (same window logic as above)
+    // 4) stats12: ALWAYS last 12 months ending this month
     const s12Scaffold = lastNMonthsScaffold(12)
     const s12StartISO = monthStartUTC(s12Scaffold[0].y, s12Scaffold[0].m0).toISOString().slice(0, 10)
     const s12EndISO = monthEndUTC(
@@ -167,7 +197,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const sigma12 = stddev(buckets12.map(r => r.qty))
     const weighted_moq = Math.ceil(weightedAvg12 * ORDER_COVERAGE_MONTHS)
 
-    // 5) Inventory & current price (shown only for info)
+    // 5) Inventory & current price (info only)
     const inv = await supabaseService
       .from('inventory_current')
       .select('on_hand, backorder')
@@ -185,7 +215,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const unit_cost_now = Number(priceNow.data?.unit_cost ?? 0)
     const unit_price_now = Number(priceNow.data?.unit_price ?? 0)
 
-    // 6) Seasonality & top customers (unchanged)
+    // 6) Seasonality & top customers
     const seas = await supabaseService.rpc('product_seasonality_last12', { p_product_id: productId })
     if (seas.error) return res.status(500).json({ error: seas.error.message })
 
@@ -211,7 +241,7 @@ router.get('/products/:id/overview', async (req, res) => {
         year: mode === 'year' ? year : undefined,
         total_qty: gpAccumulator.qty,
         total_revenue: gpAccumulator.revenue,
-        unit_cost_used: undefined, // per-sale historical costs were used; there isn't a single unit cost
+        unit_cost_used: undefined, // we used per-sale historical costs
         gross_profit
       },
       stats12: {
