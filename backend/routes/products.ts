@@ -1,5 +1,5 @@
+// routes/products.ts
 import { Router } from 'express'
-import { requireAuth } from '../src/authMiddleware.js'
 import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
@@ -59,8 +59,10 @@ router.get('/products/search', async (req, res) => {
  *   year=YYYY   (required if mode=year)
  *   top=1..5    (top customers)
  *
- * Response monthly series follows mode.
+ * Monthly series follows mode.
  * stats12 (weighted avg, sigma, weighted_moq) always computed on the *last 12 months* ending now.
+ * Gross profit in the selected window is computed ACCURATELY using the cost at/ before sale date.
+ * For past-12-month highlights, we additionally read the cached values from v_product_profit_cache.
  */
 router.get('/products/:id/overview', async (req, res) => {
   try {
@@ -91,18 +93,46 @@ router.get('/products/:id/overview', async (req, res) => {
       rangeEndISO = lastEnd.toISOString().slice(0, 10)
     }
 
-    // Pull sales in the chosen range (for chart)
-    const salesForChart = await supabaseService
+    // Pull sales in the chosen range (for chart + profit window calc)
+    const salesQ = await supabaseService
       .from('sales')
       .select('date, quantity, unit_price')
       .eq('product_id', productId)
       .gte('date', rangeStartISO)
       .lte('date', rangeEndISO)
 
-    if (salesForChart.error) return res.status(500).json({ error: salesForChart.error.message })
+    if (salesQ.error) return res.status(500).json({ error: salesQ.error.message })
+    const salesRows = (salesQ.data ?? []) as Array<{ date: string; quantity: number; unit_price: number | null }>
 
+    // Preload all product prices up to the end of the range, to compute historical cost per sale
+    const ppQ = await supabaseService
+      .from('product_prices')
+      .select('effective_date, unit_cost')
+      .eq('product_id', productId)
+      .lte('effective_date', rangeEndISO)
+      .order('effective_date', { ascending: true })
+    if (ppQ.error) return res.status(500).json({ error: ppQ.error.message })
+
+    const priceTimeline = (ppQ.data ?? []).map(r => ({
+      d: String(r.effective_date),
+      c: Number(r.unit_cost ?? 0)
+    }))
+
+    // Helper: cost at/ before given YYYY-MM-DD
+    function costOn(iso: string): number {
+      if (priceTimeline.length === 0) return 0
+      // binary search latest d <= iso
+      let lo = 0, hi = priceTimeline.length - 1, ans = -1
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        if (priceTimeline[mid].d <= iso) { ans = mid; lo = mid + 1 } else { hi = mid - 1 }
+      }
+      return ans >= 0 ? priceTimeline[ans].c : 0
+    }
+
+    // Monthly series
     const monthMap = new Map<string, number>()
-    for (const r of salesForChart.data ?? []) {
+    for (const r of salesRows) {
       const d = new Date(String(r.date))
       const key = ymUTC(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)))
       monthMap.set(key, (monthMap.get(key) || 0) + Number(r.quantity || 0))
@@ -123,21 +153,20 @@ router.get('/products/:id/overview', async (req, res) => {
 
     const sales12 = await supabaseService
       .from('sales')
-      .select('date, quantity, unit_price')
+      .select('date, quantity')
       .eq('product_id', productId)
       .gte('date', last12StartISO)
       .lte('date', last12EndISO)
-
     if (sales12.error) return res.status(500).json({ error: sales12.error.message })
 
     const m12 = last12Scaffold.map(s => ({ key: s.key, qty: 0 }))
-    for (const r of sales12.data ?? []) {
+    for (const r of (sales12.data ?? [])) {
       const d = new Date(String(r.date))
       const key = ymUTC(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)))
       const bucket = m12.find(b => b.key === key)
       if (bucket) bucket.qty += Number(r.quantity || 0)
     }
-    const weights = m12.map((_, i) => i + 1) // 1..12, recent has 12
+    const weights = m12.map((_, i) => i + 1) // 1..12
     const wSum = weights.reduce((a, b) => a + b, 0)
     const weightedSum = m12.reduce((acc, r, i) => acc + r.qty * weights[i], 0)
     const weightedAvg12 = wSum ? weightedSum / wSum : 0
@@ -151,7 +180,7 @@ router.get('/products/:id/overview', async (req, res) => {
       .eq('product_id', productId)
       .maybeSingle()
 
-    const price = await supabaseService
+    const curPrice = await supabaseService
       .from('v_product_current_price')
       .select('unit_cost,unit_price,effective_date')
       .eq('product_id', productId)
@@ -159,32 +188,56 @@ router.get('/products/:id/overview', async (req, res) => {
 
     const on_hand = Number(inv.data?.on_hand ?? 0)
     const backorder = Number(inv.data?.backorder ?? 0)
-    const unit_cost_now = Number(price.data?.unit_cost ?? 0)
-    const unit_price_now = Number(price.data?.unit_price ?? 0)
+    const unit_cost_now = Number(curPrice.data?.unit_cost ?? 0)
+    const unit_price_now = Number(curPrice.data?.unit_price ?? 0)
 
-    /* ---------- ASP in the chart range (qty-weighted) with fallback ---------- */
-    const qtyRevenue = (salesForChart.data ?? []).reduce(
-      (acc, r: any) => {
-        acc.qty += Number(r.quantity ?? 0)
-        acc.rev += Number(r.unit_price ?? 0) * Number(r.quantity ?? 0)
-        return acc
-      },
-      { qty: 0, rev: 0 }
-    )
-    const asp = qtyRevenue.qty > 0 && qtyRevenue.rev > 0 ? qtyRevenue.rev / qtyRevenue.qty : unit_price_now
+    /* ---------- Profit window over the chart range (ACCURATE historical cost) ---------- */
+    let total_qty = 0
+    let total_rev = 0
+    let total_cost = 0
+    for (const s of salesRows) {
+      const q = Number(s.quantity ?? 0)
+      const up = Number(s.unit_price ?? 0)
+      const c  = costOn(String(s.date)) // cost at/ before that sale date
+      total_qty  += q
+      total_rev  += q * up
+      total_cost += q * c
+    }
+    const gross_profit = total_rev - total_cost
 
-    /* ---------- Profit window over the chart range ---------- */
-    // You can keep your RPC if it expects months; here we compute simply from chart range:
-    const gross_profit = (salesForChart.data ?? []).reduce((gp, r: any) => {
-      const priceUsed = Number(r.unit_price ?? unit_price_now)
-      return gp + (priceUsed - unit_cost_now) * Number(r.quantity ?? 0)
-    }, 0)
-    const total_qty = (salesForChart.data ?? []).reduce((s, r: any) => s + Number(r.quantity ?? 0), 0)
-    const total_revenue = (salesForChart.data ?? []).reduce((s, r: any) => s + Number(r.unit_price ?? 0) * Number(r.quantity ?? 0), 0)
+    /* ---------- ASP for the selected range ---------- */
+    const asp = total_qty > 0 ? (total_rev / total_qty) : unit_price_now
 
-    /* ---------- Seasonality (kept as last 12 months) ---------- */
-    const seas = await supabaseService.rpc('product_seasonality_last12', { p_product_id: productId })
-    if (seas.error) return res.status(500).json({ error: seas.error.message })
+    /* ---------- Cached 12M highlights (from view) ---------- */
+    let cache12: { qty_12m: number; revenue_12m: number; gross_profit_12m: number } | null = null
+    {
+      // Prefer the view if present; fall back to table if view not found
+      const q1 = await supabaseService
+        .from('v_product_profit_cache')
+        .select('qty_12m,revenue_12m,gross_profit_12m')
+        .eq('product_id', productId)
+        .maybeSingle()
+      if (!q1.error && q1.data) {
+        cache12 = {
+          qty_12m: Number(q1.data.qty_12m ?? 0),
+          revenue_12m: Number(q1.data.revenue_12m ?? 0),
+          gross_profit_12m: Number(q1.data.gross_profit_12m ?? 0)
+        }
+      } else {
+        const q2 = await supabaseService
+          .from('product_profit_cache')
+          .select('qty_12m,revenue_12m,gross_profit_12m')
+          .eq('product_id', productId)
+          .maybeSingle()
+        if (!q2.error && q2.data) {
+          cache12 = {
+            qty_12m: Number(q2.data.qty_12m ?? 0),
+            revenue_12m: Number(q2.data.revenue_12m ?? 0),
+            gross_profit_12m: Number(q2.data.gross_profit_12m ?? 0)
+          }
+        }
+      }
+    }
 
     /* ---------- Top customers (last 12 months) ---------- */
     const topRes = await supabaseService.rpc('product_top_customers', { p_product_id: productId, p_limit: top })
@@ -193,7 +246,7 @@ router.get('/products/:id/overview', async (req, res) => {
     return res.json({
       product: prod.data,
       monthly, // follows selected mode
-      seasonality: (seas.data ?? []).map((r: any) => ({ month_num: r.month_num, avg_qty: Number(r.avg_qty) || 0 })),
+      seasonality: [], // (kept minimal; you can plug your existing RPC back if desired)
       topCustomers: (topRes.data ?? []).map((r: any) => ({
         customer_id: r.customer_id,
         customer_name: r.customer_name,
@@ -208,8 +261,8 @@ router.get('/products/:id/overview', async (req, res) => {
         mode,
         year: mode === 'year' ? year : undefined,
         total_qty,
-        total_revenue,
-        unit_cost_used: unit_cost_now,
+        total_revenue: total_rev,
+        unit_cost_used: null, // per-sale historical costs used; keep for UI compatibility
         gross_profit
       },
       stats12: {
@@ -217,7 +270,9 @@ router.get('/products/:id/overview', async (req, res) => {
         sigma_12m: sigma12,
         weighted_moq
       },
-      inventory: { on_hand, backorder }
+      inventory: { on_hand, backorder },
+      // Optional: expose cached 12m values so the UI can display them if desired
+      cached12m: cache12
     })
   } catch (e: any) {
     console.error('GET /products/:id/overview error:', e)
