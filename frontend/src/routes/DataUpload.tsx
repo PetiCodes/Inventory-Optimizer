@@ -202,28 +202,33 @@ export default function DataUpload() {
 
   /** ----------------- Recalculate 12M Gross Profit cache ----------------- */
   async function refreshGrossProfit() {
-    setRefreshErr(null)
-    setRefreshMsg(null)
-    setRefreshBusy(true)
-    try {
-      const token = (await supabase.auth.getSession()).data.session?.access_token
-      const res = await fetch(`${API}/api/admin/refresh-gross-profit`, {
-        method: 'POST',
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined
-      })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-      const msg = `Recalculated. Rows updated: ${json.rows ?? '—'}.`
-      setRefreshMsg(msg)
-      addToast(msg, 'success')
-    } catch (e: any) {
-      const m = e.message || 'Refresh failed'
-      setRefreshErr(m)
-      addToast(m, 'error')
-    } finally {
-      setRefreshBusy(false)
+  setRefreshErr(null)
+  setRefreshMsg(null)
+  setRefreshBusy(true)
+  try {
+    const token = (await supabase.auth.getSession()).data.session?.access_token
+    const headers = token ? { Authorization: `Bearer ${token}` } : undefined
+
+    // Try the preferred path first
+    let res = await fetch(`${API}/api/admin/refresh-gross-profit`, { method: 'POST', headers })
+    if (res.status === 404) {
+      // Fallback to alias
+      res = await fetch(`${API}/api/refresh-gross-profit`, { method: 'POST', headers })
     }
+    const json = await res.json()
+    if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+
+    const msg = `Recalculated. Rows updated: ${json.rows ?? '—'}.`
+    setRefreshMsg(msg)
+    addToast(msg, 'success')
+  } catch (e: any) {
+    const m = e.message || 'Refresh failed'
+    setRefreshErr(m)
+    addToast(m, 'error')
+  } finally {
+    setRefreshBusy(false)
   }
+}
 
   return (
     <AppShell>
