@@ -21,10 +21,6 @@ function last12WindowUTC() {
     endISO: endMonthEnd.toISOString().slice(0, 10)        // inclusive
   }
 }
-const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
-const wSum12 = weights12.reduce((a, b) => a + b, 0)
-
-/** Build an ascending list of YYYY-MM-01 keys for last 12 months */
 function last12MonthsKeys(): string[] {
   const now = new Date()
   const anchor = monthStartUTC(now.getUTCFullYear(), now.getUTCMonth())
@@ -40,6 +36,9 @@ function monthKeyFrom(isoDate: string): string {
   const m = isoDate.slice(5, 7)
   return `${y}-${m}-01`
 }
+
+const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
+const wSum12 = weights12.reduce((a, b) => a + b, 0)
 
 /** Types (light) */
 type SaleRow = { product_id: string; date: string; quantity: number; unit_price: number | null }
@@ -65,7 +64,10 @@ router.get('/dashboard/overview', async (_req, res) => {
       .gte('date', startISO)
       .lte('date', endISO)
 
-    if (sQ.error) return res.status(500).json({ error: sQ.error.message })
+    if (sQ.error) {
+      console.error('[dashboard] sales query error:', sQ.error)
+      return res.status(500).json({ error: sQ.error.message })
+    }
     const sales = (sQ.data ?? []) as SaleRow[]
 
     let salesQty12 = 0
@@ -96,7 +98,10 @@ router.get('/dashboard/overview', async (_req, res) => {
 
     // Inventory
     const invQ = await supabaseService.from('inventory_current').select('product_id,on_hand')
-    if (invQ.error) return res.status(500).json({ error: invQ.error.message })
+    if (invQ.error) {
+      console.error('[dashboard] inventory_current error:', invQ.error)
+      return res.status(500).json({ error: invQ.error.message })
+    }
     const onHandMap = new Map<string, number>((invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)]))
 
     // PIDs we care about (union of sales & inventory)
@@ -107,7 +112,10 @@ router.get('/dashboard/overview', async (_req, res) => {
     let nameMap = new Map<string, string>()
     if (pidList.length) {
       const nameRes = await supabaseService.from('products').select('id,name').in('id', pidList)
-      if (nameRes.error) return res.status(500).json({ error: nameRes.error.message })
+      if (nameRes.error) {
+        console.error('[dashboard] products name lookup error:', nameRes.error)
+        return res.status(500).json({ error: nameRes.error.message })
+      }
       nameMap = new Map((nameRes.data ?? []).map((p: any) => [String(p.id), String(p.name ?? '')]))
     }
 
@@ -139,23 +147,62 @@ router.get('/dashboard/overview', async (_req, res) => {
     atRisk.sort((a, b) => b.gap - a.gap)
     const atRiskTop20 = atRisk.slice(0, 20)
 
-    /** 4) Top products (12M) from the cache view — already accurate GP */
-    // Prefer the view with name pre-joined, but gracefully fall back if not present.
-    const topQ = await supabaseService
+    /** 4) Top products (12M) — try the VIEW first, then fallback to TABLE + names */
+    let topProducts: Array<{
+      product_id: string
+      product_name: string
+      qty_12m: number
+      revenue_12m: number
+      gross_profit_12m: number
+    }> = []
+
+    // Attempt the view
+    const topView = await supabaseService
       .from('v_product_profit_cache')
       .select('product_id, product_name, qty_12m, revenue_12m, gross_profit_12m')
       .order('gross_profit_12m', { ascending: false })
       .limit(20)
 
-    if (topQ.error) return res.status(500).json({ error: topQ.error.message })
+    if (!topView.error) {
+      topProducts = (topView.data ?? []).map((r: any) => ({
+        product_id: String(r.product_id),
+        product_name: String(r.product_name ?? '').trim() || (nameMap.get(String(r.product_id)) ?? '(unknown product)'),
+        qty_12m: Number(r.qty_12m ?? 0),
+        revenue_12m: Number(r.revenue_12m ?? 0),
+        gross_profit_12m: Number(r.gross_profit_12m ?? 0)
+      }))
+    } else {
+      // Fallback to table + names (view missing => “Bad Request” usually)
+      console.warn('[dashboard] falling back to product_profit_cache table because view failed:', topView.error)
+      const topTbl = await supabaseService
+        .from('product_profit_cache')
+        .select('product_id, qty_12m, revenue_12m, gross_profit_12m')
+        .order('gross_profit_12m', { ascending: false })
+        .limit(20)
+      if (topTbl.error) {
+        console.error('[dashboard] product_profit_cache fallback error:', topTbl.error)
+        return res.status(500).json({ error: topTbl.error.message })
+      }
 
-    const topProducts = (topQ.data ?? []).map((r: any) => ({
-      product_id: String(r.product_id),
-      product_name: String(r.product_name ?? '').trim() || (nameMap.get(String(r.product_id)) ?? '(unknown product)'),
-      qty_12m: Number(r.qty_12m ?? 0),
-      revenue_12m: Number(r.revenue_12m ?? 0),
-      gross_profit_12m: Number(r.gross_profit_12m ?? 0)
-    }))
+      const ids = (topTbl.data ?? []).map((r: any) => String(r.product_id))
+      let localNames = new Map<string, string>()
+      if (ids.length) {
+        const nQ = await supabaseService.from('products').select('id,name').in('id', ids)
+        if (nQ.error) {
+          console.error('[dashboard] fallback names lookup error:', nQ.error)
+          return res.status(500).json({ error: nQ.error.message })
+        }
+        localNames = new Map((nQ.data ?? []).map((p: any) => [String(p.id), String(p.name ?? '')]))
+      }
+
+      topProducts = (topTbl.data ?? []).map((r: any) => ({
+        product_id: String(r.product_id),
+        product_name: (localNames.get(String(r.product_id)) || '').trim() || '(unknown product)',
+        qty_12m: Number(r.qty_12m ?? 0),
+        revenue_12m: Number(r.revenue_12m ?? 0),
+        gross_profit_12m: Number(r.gross_profit_12m ?? 0)
+      }))
+    }
 
     /** 5) Respond */
     return res.json({
