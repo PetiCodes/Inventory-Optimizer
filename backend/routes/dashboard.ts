@@ -1,4 +1,3 @@
-// backend/routes/dashboard.ts
 import { Router } from 'express'
 import { supabaseService } from '../src/supabase.js'
 
@@ -14,8 +13,14 @@ function monthEndUTC(y: number, m0: number) {
 function last12WindowUTC() {
   const now = new Date()
   const endMonthStart = monthStartUTC(now.getUTCFullYear(), now.getUTCMonth())
-  const startMonthStart = monthStartUTC(endMonthStart.getUTCFullYear(), endMonthStart.getUTCMonth() - 11)
-  const endMonthEnd = monthEndUTC(endMonthStart.getUTCFullYear(), endMonthStart.getUTCMonth())
+  const startMonthStart = monthStartUTC(
+    endMonthStart.getUTCFullYear(),
+    endMonthStart.getUTCMonth() - 11
+  )
+  const endMonthEnd = monthEndUTC(
+    endMonthStart.getUTCFullYear(),
+    endMonthStart.getUTCMonth()
+  )
   return {
     startISO: startMonthStart.toISOString().slice(0, 10),
     endISO: endMonthEnd.toISOString().slice(0, 10),
@@ -56,7 +61,7 @@ const wSum12 = weights12.reduce((a, b) => a + b, 0)
 /** ───────────── Route ───────────── */
 router.get('/dashboard/overview', async (_req, res) => {
   try {
-    // 1) Totals (accurate counts)
+    // 1) Totals (counts)
     const prodHead = await supabaseService.from('products').select('id', { count: 'exact', head: true })
     if (prodHead.error) return res.status(500).json({ error: prodHead.error.message })
     const productsCount = prodHead.count ?? 0
@@ -65,30 +70,48 @@ router.get('/dashboard/overview', async (_req, res) => {
     if (custHead.error) return res.status(500).json({ error: custHead.error.message })
     const customersCount = custHead.count ?? 0
 
-    // 2) Sales totals for the exact last-12-month window (month-aligned)
+    // 2) KPI totals (as requested)
     const { startISO, endISO } = last12WindowUTC()
+
+    // Revenue = sum of revenue_12m from product_kpis_12m
+    const revQ = await supabaseService
+      .from('product_kpis_12m')
+      .select('revenue_12m')
+    if (revQ.error) {
+      console.error('[dashboard] revenue from product_kpis_12m error:', revQ.error)
+      return res.status(500).json({ error: revQ.error.message })
+    }
+    const sales_12m_revenue = (revQ.data ?? []).reduce(
+      (s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0
+    )
+
+    // Sales Qty = sum of last-12 months from v_sales_monthly_total
+    // (assumes columns: month (date) and total_qty)
+    const qtyQ = await supabaseService
+      .from('v_sales_monthly_total')
+      .select('month,total_qty')
+      .gte('month', startISO)
+      .lte('month', endISO)
+    if (qtyQ.error) {
+      console.error('[dashboard] qty from v_sales_monthly_total error:', qtyQ.error)
+      return res.status(500).json({ error: qtyQ.error.message })
+    }
+    const sales_12m_qty = (qtyQ.data ?? []).reduce(
+      (s: number, r: any) => s + Number(r.total_qty ?? 0), 0
+    )
+
+    // 3) Build monthly buckets for At-Risk (use raw sales just for this)
     const sQ = await supabaseService
       .from('sales')
       .select('product_id, date, quantity, unit_price')
       .gte('date', startISO)
       .lte('date', endISO)
-
     if (sQ.error) {
-      console.error('[dashboard] sales query error:', sQ.error)
+      console.error('[dashboard] sales query (at-risk) error:', sQ.error)
       return res.status(500).json({ error: sQ.error.message })
     }
     const sales = (sQ.data ?? []) as SaleRow[]
 
-    let salesQty12 = 0
-    let salesRevenue12 = 0
-    for (const r of sales) {
-      const q  = Number(r.quantity ?? 0)
-      const up = Number(r.unit_price ?? 0)
-      salesQty12 += q
-      salesRevenue12 += q * up
-    }
-
-    // 3) Build monthly buckets for At-Risk calc
     const keys = last12MonthKeys()
     const keyIndex = new Map<string, number>()
     keys.forEach((k, i) => keyIndex.set(k, i))
@@ -110,9 +133,11 @@ router.get('/dashboard/overview', async (_req, res) => {
       console.error('[dashboard] inventory_current error:', invQ.error)
       return res.status(500).json({ error: invQ.error.message })
     }
-    const onHandMap = new Map<string, number>((invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)]))
+    const onHandMap = new Map<string, number>(
+      (invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)])
+    )
 
-    // 5) Compute At-Risk rows (WITHOUT names yet)
+    // 5) Compute At-Risk rows (WITHOUT names)
     type AtRiskRow = {
       product_id: string
       on_hand: number
@@ -138,7 +163,7 @@ router.get('/dashboard/overview', async (_req, res) => {
     atRiskRaw.sort((a, b) => b.gap - a.gap)
     const atRiskTop20 = atRiskRaw.slice(0, 20)
 
-    // 6) Fetch names ONLY for the At-Risk Top 20 (small, safe)
+    // 6) Fetch names ONLY for the At-Risk Top 20
     const atRiskIds = atRiskTop20.map(r => r.product_id).filter(isUUID)
     let nameMap = new Map<string, string>()
     if (atRiskIds.length > 0) {
@@ -161,7 +186,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       gap: r.gap,
     }))
 
-    // 7) Top Products — prefer view (already has names), fallback to table + name lookup for those 20 only
+    // 7) Top Products — prefer view, fallback to table + name lookup
     let topProducts: Array<{
       product_id: string
       product_name: string
@@ -225,8 +250,8 @@ router.get('/dashboard/overview', async (_req, res) => {
       totals: {
         products: productsCount,
         customers: customersCount,
-        sales_12m_qty: salesQty12,
-        sales_12m_revenue: salesRevenue12,
+        sales_12m_qty,
+        sales_12m_revenue,
       },
       atRisk,
       topProducts,
