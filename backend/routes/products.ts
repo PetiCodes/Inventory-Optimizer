@@ -3,32 +3,48 @@ import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
-/** Helpers */
-const startOfMonthISO = (d: Date) =>
-  `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`
-
-function lastNMonthsUTC(n: number): string[] {
+/** Date helpers (UTC, month-aligned) */
+function monthStartUTC(y: number, m0: number) {
+  return new Date(Date.UTC(y, m0, 1))
+}
+function monthEndUTC(y: number, m0: number) {
+  // day 0 of next month == last day of this month
+  return new Date(Date.UTC(y, m0 + 1, 0))
+}
+function ymKeyUTC(d: Date): string {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+}
+function lastNMonthsScaffold(n: number) {
   const now = new Date()
-  const arr: string[] = []
+  const anchorStart = monthStartUTC(now.getUTCFullYear(), now.getUTCMonth())
+  const out: { key: string; y: number; m0: number }[] = []
   for (let i = n - 1; i >= 0; i--) {
-    const dt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1))
-    arr.push(startOfMonthISO(dt))
+    const d = monthStartUTC(anchorStart.getUTCFullYear(), anchorStart.getUTCMonth() - i)
+    out.push({ key: ymKeyUTC(d), y: d.getUTCFullYear(), m0: d.getUTCMonth() })
   }
-  return arr
+  return out
 }
-function monthKeyFromDateStr(isoDate: string): string {
-  if (!isoDate || isoDate.length < 7) return ''
-  const y = isoDate.slice(0, 4)
-  const m = isoDate.slice(5, 7)
-  return `${y}-${m}-01`
+function scaffoldYearUTC(year: number) {
+  return Array.from({ length: 12 }, (_, i) => {
+    const d = monthStartUTC(year, i)
+    return { key: ymKeyUTC(d), y: d.getUTCFullYear(), m0: d.getUTCMonth() }
+  })
 }
+function stddev(nums: number[]): number {
+  if (!nums.length) return 0
+  const mean = nums.reduce((a, b) => a + b, 0) / nums.length
+  const v = nums.reduce((acc, x) => acc + Math.pow(x - mean, 2), 0) / nums.length
+  return Math.sqrt(v)
+}
+const ORDER_COVERAGE_MONTHS = 4
 
-const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
-const wSum12 = weights12.reduce((a, b) => a + b, 0)
-
-type SaleRow = { date: string; quantity: number; unit_price: number | null }
-type PriceRow = { effective_date: string; unit_cost: number | null }
-
+/**
+ * GET /api/products/:id/overview
+ *  Query:
+ *    mode=last12 | year
+ *    year=YYYY   (required if mode=year)
+ *    top=1..5
+ */
 router.get('/products/:id/overview', async (req, res) => {
   try {
     const productId = String(req.params.id)
@@ -36,155 +52,140 @@ router.get('/products/:id/overview', async (req, res) => {
     const year = req.query.year ? Number(req.query.year) : undefined
     const top = Math.max(1, Math.min(Number(req.query.top ?? 5), 5))
 
-    // product header
-    const prod = await supabaseService
-      .from('products')
-      .select('id,name')
-      .eq('id', productId)
-      .single()
+    // Product header
+    const prod = await supabaseService.from('products').select('id,name').eq('id', productId).single()
     if (prod.error || !prod.data) return res.status(404).json({ error: 'Product not found' })
 
-    // build chart range
-    let chartStartISO: string
-    let chartEndISO: string
+    // Build the time window + X-axis scaffold for the chart
+    let scaffold: { key: string; y: number; m0: number }[]
+    let rangeStartISO: string
+    let rangeEndISO: string
+
     if (mode === 'year' && year && Number.isFinite(year)) {
-      chartStartISO = `${year}-01-01`
-      chartEndISO = `${year}-12-31`
+      scaffold = scaffoldYearUTC(year)
+      rangeStartISO = `${year}-01-01`
+      rangeEndISO = `${year}-12-31`
     } else {
-      const months = lastNMonthsUTC(12)
-      chartStartISO = `${months[0]}`
-      const last = months[months.length - 1]
-      const end = new Date(Date.UTC(+last.slice(0, 4), +last.slice(5, 7), 0))
-      chartEndISO = end.toISOString().slice(0, 10)
+      scaffold = lastNMonthsScaffold(12)
+      const first = scaffold[0]
+      const last = scaffold[scaffold.length - 1]
+      rangeStartISO = monthStartUTC(first.y, first.m0).toISOString().slice(0, 10)
+      rangeEndISO = monthEndUTC(last.y, last.m0).toISOString().slice(0, 10)
     }
 
-    // sales in chart range (used for chart and profit window)
-    const sChart = await supabaseService
+    // 1) Pull sales within the chosen range
+    const salesQ = await supabaseService
       .from('sales')
-      .select('date,quantity,unit_price')
+      .select('date, quantity, unit_price')
       .eq('product_id', productId)
-      .gte('date', chartStartISO)
-      .lte('date', chartEndISO)
+      .gte('date', rangeStartISO)
+      .lte('date', rangeEndISO)
       .order('date', { ascending: true })
 
-    if (sChart.error) return res.status(500).json({ error: sChart.error.message })
-    const salesForChart: SaleRow[] = (sChart.data ?? []).map(r => ({
+    if (salesQ.error) return res.status(500).json({ error: salesQ.error.message })
+    const sales = (salesQ.data ?? []).map(r => ({
       date: String(r.date),
-      quantity: Number(r.quantity ?? 0),
-      unit_price: r.unit_price == null ? null : Number(r.unit_price)
+      qty: Number(r.quantity ?? 0),
+      unit_price: Number(r.unit_price ?? 0)
     }))
 
-    // prices up to chart end date (to lookup historical cost)
-    const pRows = await supabaseService
+    // 2) Pull all price records up to the end of range, then scan to find cost-at-sale-date
+    const pricesQ = await supabaseService
       .from('product_prices')
-      .select('effective_date,unit_cost')
+      .select('effective_date, unit_cost')
       .eq('product_id', productId)
-      .lte('effective_date', chartEndISO)
+      .lte('effective_date', rangeEndISO)
       .order('effective_date', { ascending: true })
-    if (pRows.error) return res.status(500).json({ error: pRows.error.message })
 
-    const prices: PriceRow[] = (pRows.data ?? []).map(r => ({
-      effective_date: String(r.effective_date),
-      unit_cost: r.unit_cost == null ? null : Number(r.unit_cost)
+    if (pricesQ.error) return res.status(500).json({ error: pricesQ.error.message })
+    const pricePoints = (pricesQ.data ?? []).map(p => ({
+      eff: String(p.effective_date),
+      cost: Number(p.unit_cost ?? 0)
     }))
 
-    // current inventory + current price for display only
+    // Scan: for each sale date, use last price.effective_date <= sale.date
+    let pi = 0
+    let currentCost = pricePoints.length ? pricePoints[0].cost : 0
+    const gpAccumulator = { qty: 0, revenue: 0, cost: 0 }
+
+    for (const s of sales) {
+      // advance cost pointer to latest <= sale date
+      while (pi + 1 < pricePoints.length && pricePoints[pi + 1].eff <= s.date) {
+        pi++
+        currentCost = pricePoints[pi].cost
+      }
+      const revenue = s.unit_price * s.qty
+      const cost = currentCost * s.qty
+
+      gpAccumulator.qty += s.qty
+      gpAccumulator.revenue += revenue
+      gpAccumulator.cost += cost
+    }
+
+    const gross_profit = gpAccumulator.revenue - gpAccumulator.cost
+    const aspWeighted = gpAccumulator.qty > 0 ? gpAccumulator.revenue / gpAccumulator.qty : 0
+
+    // 3) Build monthly series (qty) for the chart from the same sales set
+    const monthMap = new Map<string, number>()
+    for (const s of sales) {
+      const d = new Date(s.date + 'T00:00:00Z')
+      const key = ymKeyUTC(monthStartUTC(d.getUTCFullYear(), d.getUTCMonth()))
+      monthMap.set(key, (monthMap.get(key) || 0) + s.qty)
+    }
+    const monthly = scaffold.map(s => ({
+      month: `${s.key}-01`,
+      qty: monthMap.get(s.key) ?? 0
+    }))
+
+    // 4) stats12: ALWAYS do last 12 months ending this month (same window logic as above)
+    const s12Scaffold = lastNMonthsScaffold(12)
+    const s12StartISO = monthStartUTC(s12Scaffold[0].y, s12Scaffold[0].m0).toISOString().slice(0, 10)
+    const s12EndISO = monthEndUTC(
+      s12Scaffold[s12Scaffold.length - 1].y,
+      s12Scaffold[s12Scaffold.length - 1].m0
+    ).toISOString().slice(0, 10)
+
+    const s12Q = await supabaseService
+      .from('sales')
+      .select('date, quantity')
+      .eq('product_id', productId)
+      .gte('date', s12StartISO)
+      .lte('date', s12EndISO)
+
+    if (s12Q.error) return res.status(500).json({ error: s12Q.error.message })
+    const buckets12 = s12Scaffold.map(s => ({ key: s.key, qty: 0 }))
+    for (const r of s12Q.data ?? []) {
+      const d = new Date(String(r.date) + 'T00:00:00Z')
+      const key = ymKeyUTC(monthStartUTC(d.getUTCFullYear(), d.getUTCMonth()))
+      const b = buckets12.find(x => x.key === key)
+      if (b) b.qty += Number(r.quantity ?? 0)
+    }
+    const weights = buckets12.map((_, i) => i + 1) // 1..12 (recent has highest)
+    const wSum = weights.reduce((a, b) => a + b, 0)
+    const weightedSum = buckets12.reduce((acc, r, i) => acc + r.qty * weights[i], 0)
+    const weightedAvg12 = wSum ? weightedSum / wSum : 0
+    const sigma12 = stddev(buckets12.map(r => r.qty))
+    const weighted_moq = Math.ceil(weightedAvg12 * ORDER_COVERAGE_MONTHS)
+
+    // 5) Inventory & current price (shown only for info)
     const inv = await supabaseService
       .from('inventory_current')
-      .select('on_hand,backorder')
+      .select('on_hand, backorder')
       .eq('product_id', productId)
       .maybeSingle()
-    const cur = await supabaseService
+
+    const priceNow = await supabaseService
       .from('v_product_current_price')
-      .select('unit_cost,unit_price')
+      .select('unit_cost, unit_price, effective_date')
       .eq('product_id', productId)
       .maybeSingle()
 
     const on_hand = Number(inv.data?.on_hand ?? 0)
     const backorder = Number(inv.data?.backorder ?? 0)
-    const unit_cost_now = Number(cur.data?.unit_cost ?? 0)
-    const unit_price_now = Number(cur.data?.unit_price ?? 0)
+    const unit_cost_now = Number(priceNow.data?.unit_cost ?? 0)
+    const unit_price_now = Number(priceNow.data?.unit_price ?? 0)
 
-    // ---------- Monthly chart series ----------
-    // scaffold for the chosen range
-    const scaffold: string[] = (() => {
-      if (mode === 'year' && year && Number.isFinite(year)) {
-        return Array.from({ length: 12 }, (_, i) => {
-          const d = new Date(Date.UTC(year, i, 1))
-          return startOfMonthISO(d)
-        })
-      }
-      return lastNMonthsUTC(12)
-    })()
-    const monthIndex = new Map(scaffold.map((m, i) => [m, i]))
-    const monthlyQty = Array(scaffold.length).fill(0)
-    for (const r of salesForChart) {
-      const key = monthKeyFromDateStr(r.date)
-      const idx = monthIndex.get(key)
-      if (idx != null) monthlyQty[idx] += r.quantity
-    }
-    const monthly = scaffold.map((m, i) => ({ month: `${m}-01`, qty: monthlyQty[i] }))
-
-    // ---------- Last 12 months stats (weighted moq etc.) ----------
-    const months12 = lastNMonthsUTC(12)
-    const s12 = await supabaseService
-      .from('sales')
-      .select('date,quantity')
-      .eq('product_id', productId)
-      .gte('date', months12[0])
-      .lte(
-        'date',
-        (() => {
-          const end = new Date(Date.UTC(+months12[11].slice(0, 4), +months12[11].slice(5, 7), 0))
-          return end.toISOString().slice(0, 10)
-        })()
-      )
-    if (s12.error) return res.status(500).json({ error: s12.error.message })
-
-    const monthIndex12 = new Map(months12.map((m, i) => [m, i]))
-    const qty12 = Array(12).fill(0)
-    for (const r of (s12.data ?? [])) {
-      const key = monthKeyFromDateStr(String(r.date))
-      const idx = monthIndex12.get(key)
-      if (idx != null) qty12[idx] += Number(r.quantity ?? 0)
-    }
-    const weightedSum = qty12.reduce((acc, q, i) => acc + q * weights12[i], 0)
-    const weightedAvg12 = wSum12 ? weightedSum / wSum12 : 0
-    const sigma12 = (() => {
-      const mean = qty12.reduce((a, b) => a + b, 0) / (qty12.length || 1)
-      const v = qty12.reduce((acc, x) => acc + Math.pow(x - mean, 2), 0) / (qty12.length || 1)
-      return Math.sqrt(v)
-    })()
-    const weighted_moq = Math.ceil(weightedAvg12 * 4) // your 4-month coverage
-
-    // ---------- Accurate profit window over chart range ----------
-    // revenue: sum(qty * COALESCE(unit_price,0))
-    // cost: for each sale, use latest cost with effective_date <= sale.date
-    // (prices is sorted asc by effective_date)
-    let rev = 0
-    let qty = 0
-    let cost = 0
-    let pIdx = prices.length - 1 // start from end for quick backwards search
-
-    function costAt(dateISO: string): number {
-      // walk back until effective_date <= sale.date
-      while (pIdx >= 0 && prices[pIdx].effective_date > dateISO) pIdx--
-      if (pIdx >= 0) return Number(prices[pIdx].unit_cost ?? 0)
-      return 0 // no price before the sale -> cost 0
-    }
-
-    for (const r of salesForChart) {
-      const uprice = Number(r.unit_price ?? 0)
-      const q = Number(r.quantity ?? 0)
-      const c = costAt(r.date)
-      rev += q * uprice
-      qty += q
-      cost += q * c
-    }
-    const gp = rev - cost
-    const asp = qty > 0 && rev > 0 ? rev / qty : unit_price_now
-
-    // ---------- Seasonality & top customers (unchanged) ----------
+    // 6) Seasonality & top customers (unchanged)
     const seas = await supabaseService.rpc('product_seasonality_last12', { p_product_id: productId })
     if (seas.error) return res.status(500).json({ error: seas.error.message })
 
@@ -201,17 +202,17 @@ router.get('/products/:id/overview', async (req, res) => {
         qty: Number(r.qty) || 0
       })),
       pricing: {
-        average_selling_price: asp,
+        average_selling_price: aspWeighted,
         current_unit_cost: unit_cost_now,
         current_unit_price: unit_price_now
       },
       profit_window: {
         mode,
         year: mode === 'year' ? year : undefined,
-        total_qty: qty,
-        total_revenue: rev,
-        unit_cost_used: unit_cost_now, // display only
-        gross_profit: gp
+        total_qty: gpAccumulator.qty,
+        total_revenue: gpAccumulator.revenue,
+        unit_cost_used: undefined, // per-sale historical costs were used; there isn't a single unit cost
+        gross_profit
       },
       stats12: {
         weighted_avg_12m: weightedAvg12,
