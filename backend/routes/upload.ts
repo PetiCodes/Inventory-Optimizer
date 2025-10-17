@@ -1,4 +1,4 @@
-// routes/upload.ts
+// backend/routes/upload.ts
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
@@ -220,16 +220,18 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const custMap = new Map(custRows.map(c => [c.name, c.id]))
     const prodMap = new Map(prodRows.map(p => [p.name, p.id]))
 
-    // Build sales payload
-    const salesPayload = clean.map(r => ({
-      date: r.Date,
-      quantity: r.Quantity,
-      unit_price: r.Price,            // may be null
-      customer_id: custMap.get(r.Customer) as string | undefined,
-      product_id: prodMap.get(r.Product) as string | undefined
-    })).filter(x => x.customer_id && x.product_id) as Array<{
-      date: string; quantity: number; unit_price: number | null; customer_id: string; product_id: string;
-    }>
+    // Build sales payload (no dedupe, simple insert)
+    const salesPayload = clean
+      .map(r => ({
+        date: r.Date,
+        quantity: r.Quantity,
+        unit_price: r.Price, // may be null
+        customer_id: custMap.get(r.Customer) as string | undefined,
+        product_id: prodMap.get(r.Product) as string | undefined
+      }))
+      .filter(x => x.customer_id && x.product_id) as Array<{
+        date: string; quantity: number; unit_price: number | null; customer_id: string; product_id: string;
+      }>
 
     if (!salesPayload.length) {
       return res.status(400).json({
@@ -240,20 +242,13 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // 🚫 DEDUPE: safe re-uploads using UPSERT on the composite unique key
-    // Requires the unique index from the SQL section.
+    // Insert in batches (no upsert)
+    const batches = chunk(salesPayload, 250)
     let inserted = 0
-    for (const b of chunk(salesPayload, 250)) {
-      const ins = await supabaseService
-        .from('sales')
-        .upsert(b, {
-          onConflict: 'date,customer_id,product_id,unit_price,quantity',
-          ignoreDuplicates: false,
-          count: 'exact'
-        })
+    for (const b of batches) {
+      const ins = await supabaseService.from('sales').insert(b, { count: 'exact' })
       if (ins.error) {
-        // If index is missing, PostgREST raises an error. Surface clearly:
-        return res.status(500).json({ error: ins.error.message, hint: 'Ensure the unique index on sales exists (see instructions).', inserted })
+        return res.status(500).json({ error: ins.error.message, inserted })
       }
       inserted += ins.count ?? b.length
     }
