@@ -11,6 +11,7 @@ import productsRouter from '../routes/products.js'
 import dashboardRouter from '../routes/dashboard.js'
 import customersRouter from '../routes/customers.js'
 import inventoryRouter from '../routes/inventory.js'
+import adminRouter from '../routes/admin.js'
 
 const app = express()
 
@@ -59,6 +60,7 @@ app.use('/api', productsRouter)
 app.use('/api', dashboardRouter)
 app.use('/api', customersRouter)
 app.use('/api', inventoryRouter)    // POST /api/inventory/upload
+app.use('/api', adminRouter)
 
 // fallback 404 (optional)
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
