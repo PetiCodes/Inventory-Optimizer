@@ -20,6 +20,7 @@ const SALES_REQUIRED_HEADERS = ['Date', 'Customer Name', 'Product', 'Quantity', 
 
 export default function DataUpload() {
   const { addToast } = useToast()
+  const API = (import.meta as any).env.VITE_API_BASE as string
 
   // Sales upload state
   const [salesFile, setSalesFile] = useState<File | null>(null)
@@ -33,6 +34,11 @@ export default function DataUpload() {
   const [invUploading, setInvUploading] = useState(false)
   const [invErrors, setInvErrors] = useState<string[]>([])
   const [invSummary, setInvSummary] = useState<any | null>(null)
+
+  // Recalc GP cache
+  const [refreshBusy, setRefreshBusy] = useState(false)
+  const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
+  const [refreshErr, setRefreshErr] = useState<string | null>(null)
 
   /** ----------------- Helpers ----------------- */
   function isCSV(name: string) {
@@ -133,14 +139,11 @@ export default function DataUpload() {
       const fd = new FormData()
       fd.append('file', salesFile)
 
-      const res = await fetch(
-        (import.meta as any).env.VITE_API_BASE + '/api/upload',
-        {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` },
-          body: fd,
-        }
-      )
+      const res = await fetch(`${API}/api/upload`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: fd,
+      })
 
       const data = await res.json()
       setSalesSummary(data)
@@ -174,14 +177,11 @@ export default function DataUpload() {
       const fd = new FormData()
       fd.append('file', invFile)
 
-      const res = await fetch(
-        (import.meta as any).env.VITE_API_BASE + '/api/inventory/upload',
-        {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` },
-          body: fd,
-        }
-      )
+      const res = await fetch(`${API}/api/inventory/upload`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: fd,
+      })
 
       const data = await res.json()
       setInvSummary(data)
@@ -200,15 +200,54 @@ export default function DataUpload() {
     }
   }
 
+  /** ----------------- Recalculate 12M Gross Profit cache ----------------- */
+  async function refreshGrossProfit() {
+    setRefreshErr(null)
+    setRefreshMsg(null)
+    setRefreshBusy(true)
+    try {
+      const token = (await supabase.auth.getSession()).data.session?.access_token
+      const res = await fetch(`${API}/api/admin/refresh-gross-profit`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined
+      })
+      const json = await res.json()
+      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+      const msg = `Recalculated. Rows updated: ${json.rows ?? '—'}.`
+      setRefreshMsg(msg)
+      addToast(msg, 'success')
+    } catch (e: any) {
+      const m = e.message || 'Refresh failed'
+      setRefreshErr(m)
+      addToast(m, 'error')
+    } finally {
+      setRefreshBusy(false)
+    }
+  }
+
   return (
     <AppShell>
       <div className="space-y-8">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">Data Upload</h1>
-          <p className="text-gray-600">
-            Upload Sales and Inventory files. Your backend will validate, map, and import.
-          </p>
+        <div className="flex items-start justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900">Data Upload</h1>
+            <p className="text-gray-600">
+              Upload Sales and Inventory files. Then recalculate the 12-month gross profit cache.
+            </p>
+          </div>
+          <Button onClick={refreshGrossProfit} disabled={refreshBusy}>
+            {refreshBusy ? (
+              <span className="inline-flex items-center gap-2">
+                <Spinner size="sm" /> Recalculating…
+              </span>
+            ) : (
+              'Recalculate Gross Profit (12M)'
+            )}
+          </Button>
         </div>
+
+        {refreshErr && <Alert variant="error">{refreshErr}</Alert>}
+        {refreshMsg && <Alert variant="success">{refreshMsg}</Alert>}
 
         {/* ----------------- Sales Upload ----------------- */}
         <Card>
