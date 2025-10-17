@@ -1,3 +1,4 @@
+// backend/routes/dashboard.ts
 import { Router } from 'express'
 import { supabaseService } from '../src/supabase.js'
 
@@ -17,10 +18,10 @@ function last12WindowUTC() {
   const endMonthEnd = monthEndUTC(endMonthStart.getUTCFullYear(), endMonthStart.getUTCMonth())
   return {
     startISO: startMonthStart.toISOString().slice(0, 10),
-    endISO: endMonthEnd.toISOString().slice(0, 10)
+    endISO: endMonthEnd.toISOString().slice(0, 10),
   }
 }
-function last12MonthsKeys(): string[] {
+function last12MonthKeys(): string[] {
   const now = new Date()
   const anchor = monthStartUTC(now.getUTCFullYear(), now.getUTCMonth())
   const out: string[] = []
@@ -30,26 +31,32 @@ function last12MonthsKeys(): string[] {
   }
   return out
 }
-function monthKeyFrom(isoDate: string): string {
-  const y = isoDate.slice(0, 4)
-  const m = isoDate.slice(5, 7)
+function monthKeyFromISO(iso: string): string {
+  const y = iso.slice(0, 4)
+  const m = iso.slice(5, 7)
   return `${y}-${m}-01`
 }
 
-/** simple uuid guard (relaxed, good enough for Postgres uuid cast) */
+/** ───────────── Utils ───────────── */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const isUUID = (v: any) => typeof v === 'string' && UUID_RE.test(v)
+const isUUID = (v: any): v is string => typeof v === 'string' && UUID_RE.test(v)
+function chunk<T>(arr: T[], size = 200): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
+  return out
+}
+
+/** ───────────── Types ───────────── */
+type SaleRow = { product_id: string; date: string; quantity: number; unit_price: number | null }
+type InvRow  = { product_id: string; on_hand: number | null }
 
 const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
 
-/** Types */
-type SaleRow = { product_id: string; date: string; quantity: number; unit_price: number | null }
-type InvRow  = { product_id: string; on_hand: number | null }
-
+/** ───────────── Route ───────────── */
 router.get('/dashboard/overview', async (_req, res) => {
   try {
-    /** 1) Totals */
+    // 1) Totals (accurate counts)
     const prodHead = await supabaseService.from('products').select('id', { count: 'exact', head: true })
     if (prodHead.error) return res.status(500).json({ error: prodHead.error.message })
     const productsCount = prodHead.count ?? 0
@@ -58,7 +65,7 @@ router.get('/dashboard/overview', async (_req, res) => {
     if (custHead.error) return res.status(500).json({ error: custHead.error.message })
     const customersCount = custHead.count ?? 0
 
-    /** 2) Last 12 months sales (exact month window, inclusive) */
+    // 2) Sales totals for the exact last-12-month window (month-aligned)
     const { startISO, endISO } = last12WindowUTC()
     const sQ = await supabaseService
       .from('sales')
@@ -75,28 +82,29 @@ router.get('/dashboard/overview', async (_req, res) => {
     let salesQty12 = 0
     let salesRevenue12 = 0
     for (const r of sales) {
-      const q = Number(r.quantity ?? 0)
+      const q  = Number(r.quantity ?? 0)
       const up = Number(r.unit_price ?? 0)
       salesQty12 += q
       salesRevenue12 += q * up
     }
 
-    /** 3) At-Risk of stockout */
-    const keys = last12MonthsKeys()
-    const idx = new Map<string, number>()
-    keys.forEach((k, i) => idx.set(k, i))
+    // 3) Build monthly buckets for At-Risk calc
+    const keys = last12MonthKeys()
+    const keyIndex = new Map<string, number>()
+    keys.forEach((k, i) => keyIndex.set(k, i))
 
-    const perProd = new Map<string, number[]>() // pid -> [12]
+    const perProdMonthly = new Map<string, number[]>() // pid -> [12]
     for (const r of sales) {
-      const k = monthKeyFrom(String(r.date))
-      const i = idx.get(k)
-      if (i === undefined) continue
+      const mk = monthKeyFromISO(String(r.date))
+      const idx = keyIndex.get(mk)
+      if (idx === undefined) continue
       const pid = String(r.product_id)
-      const arr = perProd.get(pid) ?? Array(12).fill(0)
-      arr[i] += Number(r.quantity ?? 0)
-      perProd.set(pid, arr)
+      const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
+      arr[idx] += Number(r.quantity ?? 0)
+      perProdMonthly.set(pid, arr)
     }
 
+    // 4) Inventory now
     const invQ = await supabaseService.from('inventory_current').select('product_id,on_hand')
     if (invQ.error) {
       console.error('[dashboard] inventory_current error:', invQ.error)
@@ -104,53 +112,56 @@ router.get('/dashboard/overview', async (_req, res) => {
     }
     const onHandMap = new Map<string, number>((invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)]))
 
-    // union of product ids from sales + inventory, and **only valid uuids**
-    const pidSet = new Set<string>([
-      ...Array.from(perProd.keys()),
-      ...Array.from(onHandMap.keys())
-    ])
-    const pidList = Array.from(pidSet).filter(isUUID)
-
-    // fetch names ONLY for valid UUIDs
-    let nameMap = new Map<string, string>()
-    if (pidList.length > 0) {
-      const nameRes = await supabaseService.from('products').select('id,name').in('id', pidList)
-      if (nameRes.error) {
-        console.error('[dashboard] products name lookup error:', nameRes.error)
-        return res.status(500).json({ error: nameRes.error.message })
-      }
-      nameMap = new Map((nameRes.data ?? []).map((p: any) => [String(p.id), String(p.name ?? '')]))
-    }
-
+    // 5) Compute At-Risk rows (WITHOUT names yet)
     type AtRiskRow = {
       product_id: string
-      product_name: string
       on_hand: number
       weighted_moq: number
       gap: number
     }
-    const atRisk: AtRiskRow[] = []
-    for (const pid of pidList) {
-      const arr = perProd.get(pid) ?? Array(12).fill(0)
-      const weightedSum = arr.reduce((acc, q, i) => acc + q * weights12[i], 0)
-      const weighted_moq = Math.ceil(wSum12 ? weightedSum / wSum12 : 0)
+    const pidSet = new Set<string>([
+      ...Array.from(perProdMonthly.keys()),
+      ...Array.from(onHandMap.keys()),
+    ])
+    const atRiskRaw: AtRiskRow[] = []
+    for (const pid of pidSet) {
+      if (!isUUID(pid)) continue
+      const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
+      const weightedSum = arr.reduce((sum, q, i) => sum + q * weights12[i], 0)
+      const weighted_moq = Math.ceil(wSum12 ? (weightedSum / wSum12) : 0)
       const onHand = onHandMap.get(pid) ?? 0
       const gap = Math.max(0, weighted_moq - onHand)
       if (gap > 0) {
-        const nm = (nameMap.get(pid) || '').trim()
-        atRisk.push({
-          product_id: pid,
-          product_name: nm || '(unknown product)',
-          on_hand: onHand,
-          weighted_moq,
-          gap
-        })
+        atRiskRaw.push({ product_id: pid, on_hand: onHand, weighted_moq, gap })
       }
     }
-    atRisk.sort((a, b) => b.gap - a.gap)
-    const atRiskTop20 = atRisk.slice(0, 20)
+    atRiskRaw.sort((a, b) => b.gap - a.gap)
+    const atRiskTop20 = atRiskRaw.slice(0, 20)
 
-    /** 4) Top products — view first, fallback to table; validate ids for name lookup */
+    // 6) Fetch names ONLY for the At-Risk Top 20 (small, safe)
+    const atRiskIds = atRiskTop20.map(r => r.product_id).filter(isUUID)
+    let nameMap = new Map<string, string>()
+    if (atRiskIds.length > 0) {
+      for (const part of chunk(atRiskIds, 200)) {
+        const nQ = await supabaseService.from('products').select('id,name').in('id', part)
+        if (nQ.error) {
+          console.error('[dashboard] name lookup (at-risk) error:', nQ.error)
+          return res.status(500).json({ error: nQ.error.message })
+        }
+        for (const p of nQ.data ?? []) {
+          nameMap.set(String(p.id), String(p.name ?? ''))
+        }
+      }
+    }
+    const atRisk = atRiskTop20.map(r => ({
+      product_id: r.product_id,
+      product_name: (nameMap.get(r.product_id) || '').trim() || '(unknown product)',
+      on_hand: r.on_hand,
+      weighted_moq: r.weighted_moq,
+      gap: r.gap,
+    }))
+
+    // 7) Top Products — prefer view (already has names), fallback to table + name lookup for those 20 only
     let topProducts: Array<{
       product_id: string
       product_name: string
@@ -159,63 +170,66 @@ router.get('/dashboard/overview', async (_req, res) => {
       gross_profit_12m: number
     }> = []
 
-    const topView = await supabaseService
+    const viewQ = await supabaseService
       .from('v_product_profit_cache')
       .select('product_id, product_name, qty_12m, revenue_12m, gross_profit_12m')
       .order('gross_profit_12m', { ascending: false })
       .limit(20)
 
-    if (!topView.error) {
-      topProducts = (topView.data ?? []).map((r: any) => ({
+    if (!viewQ.error) {
+      topProducts = (viewQ.data ?? []).map((r: any) => ({
         product_id: String(r.product_id),
-        product_name: String(r.product_name ?? '').trim()
-          || (nameMap.get(String(r.product_id)) ?? '(unknown product)'),
+        product_name: String(r.product_name ?? '').trim() || '(unknown product)',
         qty_12m: Number(r.qty_12m ?? 0),
         revenue_12m: Number(r.revenue_12m ?? 0),
-        gross_profit_12m: Number(r.gross_profit_12m ?? 0)
+        gross_profit_12m: Number(r.gross_profit_12m ?? 0),
       }))
     } else {
-      console.warn('[dashboard] falling back to product_profit_cache table:', topView.error)
-      const topTbl = await supabaseService
+      console.warn('[dashboard] falling back to product_profit_cache table:', viewQ.error)
+      const tblQ = await supabaseService
         .from('product_profit_cache')
         .select('product_id, qty_12m, revenue_12m, gross_profit_12m')
         .order('gross_profit_12m', { ascending: false })
         .limit(20)
-      if (topTbl.error) {
-        console.error('[dashboard] product_profit_cache fallback error:', topTbl.error)
-        return res.status(500).json({ error: topTbl.error.message })
+      if (tblQ.error) {
+        console.error('[dashboard] product_profit_cache fallback error:', tblQ.error)
+        return res.status(500).json({ error: tblQ.error.message })
       }
 
-      const ids = (topTbl.data ?? []).map((r: any) => String(r.product_id)).filter(isUUID)
-      let localNames = new Map<string, string>()
+      const ids = (tblQ.data ?? []).map((r: any) => String(r.product_id)).filter(isUUID)
+      let topNameMap = new Map<string, string>()
       if (ids.length > 0) {
-        const nQ = await supabaseService.from('products').select('id,name').in('id', ids)
-        if (nQ.error) {
-          console.error('[dashboard] fallback names lookup error:', nQ.error)
-          return res.status(500).json({ error: nQ.error.message })
+        for (const part of chunk(ids, 200)) {
+          const nQ = await supabaseService.from('products').select('id,name').in('id', part)
+          if (nQ.error) {
+            console.error('[dashboard] name lookup (top) error:', nQ.error)
+            return res.status(500).json({ error: nQ.error.message })
+          }
+          for (const p of nQ.data ?? []) {
+            topNameMap.set(String(p.id), String(p.name ?? ''))
+          }
         }
-        localNames = new Map((nQ.data ?? []).map((p: any) => [String(p.id), String(p.name ?? '')]))
       }
 
-      topProducts = (topTbl.data ?? []).map((r: any) => ({
+      topProducts = (tblQ.data ?? []).map((r: any) => ({
         product_id: String(r.product_id),
-        product_name: (localNames.get(String(r.product_id)) || '').trim() || '(unknown product)',
+        product_name: (topNameMap.get(String(r.product_id)) || '').trim() || '(unknown product)',
         qty_12m: Number(r.qty_12m ?? 0),
         revenue_12m: Number(r.revenue_12m ?? 0),
-        gross_profit_12m: Number(r.gross_profit_12m ?? 0)
+        gross_profit_12m: Number(r.gross_profit_12m ?? 0),
       }))
     }
 
-    /** 5) Reply */
+    // 8) Respond
     return res.json({
       totals: {
         products: productsCount,
         customers: customersCount,
         sales_12m_qty: salesQty12,
-        sales_12m_revenue: salesRevenue12
+        sales_12m_revenue: salesRevenue12,
       },
-      atRisk: atRiskTop20,
-      topProducts
+      atRisk,
+      topProducts,
     })
   } catch (e: any) {
     console.error('GET /dashboard/overview error:', e)
