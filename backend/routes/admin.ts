@@ -3,28 +3,19 @@ import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
-/**
- * Triggers the SQL function refresh_product_profit_cache() you created.
- * We expose TWO paths so either will work:
- *   POST /api/admin/refresh-gross-profit   (preferred)
- *   POST /api/refresh-gross-profit         (legacy/backup)
- */
+/* ---------------- Refresh Product Profit Cache ---------------- */
 async function handleRefresh(_req: any, res: any) {
   try {
-    // (Optional) get a count to return something meaningful
     const before = await supabaseService
       .from('product_profit_cache')
       .select('product_id', { count: 'exact', head: true })
 
     if (before.error && before.error.code !== 'PGRST116') {
-      // PGRST116 = relation not found; ignore so we can still run the function which will create/replace rows
       return res.status(500).json({ error: before.error.message })
     }
 
     const rpc = await supabaseService.rpc('refresh_product_profit_cache', {})
-    if (rpc.error) {
-      return res.status(500).json({ error: rpc.error.message })
-    }
+    if (rpc.error) return res.status(500).json({ error: rpc.error.message })
 
     const after = await supabaseService
       .from('product_profit_cache')
@@ -38,7 +29,24 @@ async function handleRefresh(_req: any, res: any) {
   }
 }
 
-router.post('/admin/refresh-gross-profit', handleRefresh) // preferred
-router.post('/refresh-gross-profit', handleRefresh)       // alias
+router.post('/admin/refresh-gross-profit', handleRefresh)
+router.post('/refresh-gross-profit', handleRefresh) // alias
+
+/* ---------------- Wipe All Data ---------------- */
+router.post('/admin/wipe-data', async (_req, res) => {
+  try {
+    // This SQL function will truncate all relevant tables.
+    const rpc = await supabaseService.rpc('wipe_all_data', {})
+    if (rpc.error) {
+      console.error('wipe-all-data error:', rpc.error)
+      return res.status(500).json({ error: rpc.error.message })
+    }
+
+    return res.json({ ok: true, message: 'All data deleted successfully.' })
+  } catch (e: any) {
+    console.error('wipe-all-data unhandled:', e)
+    return res.status(500).json({ error: e?.message || 'Failed to wipe data' })
+  }
+})
 
 export default router
