@@ -53,7 +53,6 @@ function chunk<T>(arr: T[], size = 200): T[][] {
 
 /** ───────────── Types ───────────── */
 type SaleRow = { product_id: string; date: string; quantity: number; unit_price: number | null }
-type InvRow  = { product_id: string; on_hand: number | null }
 
 const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
@@ -73,10 +72,8 @@ router.get('/dashboard/overview', async (_req, res) => {
     // 2) KPI totals (as requested)
     const { startISO, endISO } = last12WindowUTC()
 
-    // Revenue = sum of revenue_12m from product_kpis_12m
-    const revQ = await supabaseService
-      .from('product_kpis_12m')
-      .select('revenue_12m')
+    // Revenue = sum of revenue_12m from product_kpis_12m (assumes one row per product with the latest 12M)
+    const revQ = await supabaseService.from('product_kpis_12m').select('revenue_12m')
     if (revQ.error) {
       console.error('[dashboard] revenue from product_kpis_12m error:', revQ.error)
       return res.status(500).json({ error: revQ.error.message })
@@ -85,8 +82,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       (s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0
     )
 
-    // Sales Qty = sum of last-12 months from v_sales_monthly_total
-    // (assumes columns: month (date) and total_qty)
+    // Sales Qty = sum of the last 12 rows from v_sales_monthly_total in the month window
     const qtyQ = await supabaseService
       .from('v_sales_monthly_total')
       .select('month,total_qty')
@@ -186,7 +182,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       gap: r.gap,
     }))
 
-    // 7) Top Products — prefer view, fallback to table + name lookup
+    // 7) Top Products — rank strictly by gross_profit_12m DESC (prefer view)
     let topProducts: Array<{
       product_id: string
       product_name: string
@@ -210,6 +206,7 @@ router.get('/dashboard/overview', async (_req, res) => {
         gross_profit_12m: Number(r.gross_profit_12m ?? 0),
       }))
     } else {
+      // Fallback to the table + name lookup (still sorted by GP DESC)
       console.warn('[dashboard] falling back to product_profit_cache table:', viewQ.error)
       const tblQ = await supabaseService
         .from('product_profit_cache')
