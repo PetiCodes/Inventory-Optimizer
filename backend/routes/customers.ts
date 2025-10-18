@@ -1,4 +1,3 @@
-// backend/routes/customers.ts
 import { Router } from 'express'
 import { supabaseService } from '../src/supabase.js'
 
@@ -69,9 +68,17 @@ router.get('/customers/:id', async (req, res) => {
  * Returns:
  * {
  *   customer: { id, name },
- *   summary: { total_qty, distinct_products, first_date, last_date },
- *   products: [{ product_id, product_name, qty }]
+ *   summary: {
+ *     total_qty, distinct_products, first_date, last_date,
+ *     total_revenue, total_gross_profit
+ *   },
+ *   products: [{ product_id, product_name, qty, revenue, gross_profit }]
  * }
+ *
+ * Notes:
+ * - Revenue = Σ(unit_price_at_sale * qty)
+ * - GP      = Σ((unit_price_at_sale - current_unit_cost) * qty)
+ *   => computed as: revenue - (current_unit_cost * total_qty_for_that_product)
  */
 router.get('/customers/:id/overview', async (req, res) => {
   try {
@@ -82,53 +89,93 @@ router.get('/customers/:id/overview', async (req, res) => {
     if (c.error || !c.data) return res.status(404).json({ error: 'Not found' })
     const customer = c.data
 
-    // 2) summary
-    const sum = await supabaseService
+    // 2) pull all sales rows for this customer (no DB aggregates)
+    const salesQ = await supabaseService
       .from('sales')
-      .select('quantity, date, product_id', { count: 'exact', head: false })
+      .select('product_id, quantity, unit_price, date, products(name)')
       .eq('customer_id', id)
 
-    if (sum.error) return res.status(500).json({ error: sum.error.message })
+    if (salesQ.error) return res.status(500).json({ error: salesQ.error.message })
 
+    // First pass: accumulate per product qty & revenue; collect product ids and date bounds
+    type Acc = {
+      product_id: string
+      product_name: string
+      qty: number
+      revenue: number
+    }
+    const byProd = new Map<string, Acc>()
     let total_qty = 0
+    let total_revenue = 0
     let first_date: string | null = null
     let last_date: string | null = null
-    const productSet = new Set<string>()
+    const productIds = new Set<string>()
 
-    for (const r of sum.data ?? []) {
-      total_qty += Number(r.quantity || 0)
-      if (r.product_id) productSet.add(String(r.product_id))
-      const d = String(r.date)
+    for (const r of salesQ.data ?? []) {
+      const pid = String((r as any).product_id)
+      if (!pid) continue
+      productIds.add(pid)
+
+      const name = (r as any).products?.name ?? 'Unknown'
+      const qty = Number((r as any).quantity || 0)
+      const up  = Number((r as any).unit_price || 0)
+      const revenue = qty * up
+
+      const prev = byProd.get(pid) || { product_id: pid, product_name: name, qty: 0, revenue: 0 }
+      prev.qty += qty
+      prev.revenue += revenue
+      byProd.set(pid, prev)
+
+      total_qty += qty
+      total_revenue += revenue
+
+      const d = String((r as any).date || '')
       if (d) {
         if (!first_date || d < first_date) first_date = d
         if (!last_date || d > last_date) last_date = d
       }
     }
 
+    // 3) fetch current unit cost for all involved products (0 if missing)
+    const ids = Array.from(productIds)
+    const costMap = new Map<string, number>()
+    if (ids.length) {
+      const costQ = await supabaseService
+        .from('v_product_current_price')
+        .select('product_id, unit_cost')
+        .in('product_id', ids)
+
+      if (costQ.error) return res.status(500).json({ error: costQ.error.message })
+      for (const r of costQ.data ?? []) {
+        costMap.set(String((r as any).product_id), Number((r as any).unit_cost ?? 0))
+      }
+    }
+
+    // 4) compute GP per product = revenue - (current_unit_cost * qty)
+    let total_gross_profit = 0
+    const products = Array.from(byProd.values())
+      .map(p => {
+        const unit_cost_now = costMap.get(p.product_id) ?? 0
+        const gp = p.revenue - unit_cost_now * p.qty
+        total_gross_profit += gp
+        return {
+          product_id: p.product_id,
+          product_name: p.product_name,
+          qty: p.qty,
+          revenue: p.revenue,
+          gross_profit: gp,
+        }
+      })
+      .sort((a, b) => b.qty - a.qty)
+
     const summary = {
       total_qty,
-      distinct_products: productSet.size,
+      distinct_products: products.length,
       first_date,
-      last_date
+      last_date,
+      total_revenue,
+      total_gross_profit,
     }
-
-    // 3) products purchased (aggregate by product)
-    const prod = await supabaseService
-      .from('sales')
-      .select('product_id, quantity, products(name)')
-      .eq('customer_id', id)
-
-    if (prod.error) return res.status(500).json({ error: prod.error.message })
-
-    const byProd = new Map<string, { product_id: string; product_name: string; qty: number }>()
-    for (const r of prod.data ?? []) {
-      const pid = String(r.product_id)
-      const name = (r as any).products?.name ?? 'Unknown'
-      const prev = byProd.get(pid) || { product_id: pid, product_name: name, qty: 0 }
-      prev.qty += Number(r.quantity || 0)
-      byProd.set(pid, prev)
-    }
-    const products = Array.from(byProd.values()).sort((a, b) => b.qty - a.qty)
 
     res.json({ customer, summary, products })
   } catch (e: any) {
@@ -138,10 +185,6 @@ router.get('/customers/:id/overview', async (req, res) => {
 })
 
 /* ------------------------------ Monthly (last12 or specific year) ------------------------------ */
-/**
- * GET /api/customers/:id/monthly?mode=last12  OR  ?mode=year&year=2024
- * Returns 12 data points with missing months as 0.
- */
 router.get('/customers/:id/monthly', async (req, res) => {
   try {
     const customerId = String(req.params.id)
