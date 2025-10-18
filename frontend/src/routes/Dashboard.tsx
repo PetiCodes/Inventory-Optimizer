@@ -14,21 +14,21 @@ type Totals = {
   sales_12m_qty: number
   sales_12m_revenue: number
 }
-type AtRisk = {
+type AtRiskItem = {
   product_id: string
   product_name: string
   on_hand: number
   weighted_moq: number
   gap: number
 }
-type TopProduct = {
-  product_id: string
-  product_name: string
-  qty_12m: number
-  revenue_12m: number
-  gross_profit_12m: number
+type AtRiskPage = {
+  page: number
+  pageSize: number
+  total: number
+  pages: number
+  items: AtRiskItem[]
 }
-type ApiResp = { totals: Totals; atRisk: AtRisk[]; topProducts: TopProduct[] }
+type ApiResp = { totals: Totals; atRisk: AtRiskPage; topProducts?: any[] }
 
 export default function Dashboard() {
   const navigate = useNavigate()
@@ -37,15 +37,24 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // pagination state for At-Risk
+  const [page, setPage] = useState(1)
+  const [pageSize] = useState(20)
+
   async function load() {
     setLoading(true)
     setError(null)
     try {
       const token = (await supabase.auth.getSession()).data.session?.access_token
       if (!token) throw new Error('Not authenticated')
-      const res = await fetch(`${(import.meta as any).env.VITE_API_BASE}/api/dashboard/overview`, {
-        headers: { Authorization: `Bearer ${token}` }
-      })
+      const params = new URLSearchParams()
+      params.set('page', String(page))
+      params.set('pageSize', String(pageSize))
+
+      const res = await fetch(
+        `${(import.meta as any).env.VITE_API_BASE}/api/dashboard/overview?` + params.toString(),
+        { headers: { Authorization: `Bearer ${token}` } }
+      )
       const json: ApiResp | { error?: string } = await res.json()
       if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`)
       setData(json as ApiResp)
@@ -57,14 +66,14 @@ export default function Dashboard() {
     }
   }
 
-  useEffect(() => { load() }, [])
+  useEffect(() => { load() }, [page, pageSize])
 
   const fmt = new Intl.NumberFormat()
   const money = (v: number) =>
     v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
-  // Cap to top 20 in UI (server also caps; this is a safety net)
-  const atRisk = useMemo(() => (data?.atRisk ?? []).slice(0, 20), [data?.atRisk])
+  const canPrev = (data?.atRisk?.page ?? 1) > 1
+  const canNext = (data?.atRisk?.page ?? 1) < (data?.atRisk?.pages ?? 1)
 
   return (
     <AppShell>
@@ -89,7 +98,7 @@ export default function Dashboard() {
 
         {!loading && !error && data && (
           <>
-            {/* KPIs — compact */}
+            {/* KPIs */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               <Card>
                 <CardContent className="p-4">
@@ -117,12 +126,24 @@ export default function Dashboard() {
               </Card>
             </div>
 
-            {/* At-Risk — compact table with no horizontal scroll */}
+            {/* At-Risk — paginated like other pages */}
             <Card>
               <CardHeader>
                 <div className="flex items-center justify-between">
-                  <h3 className="text-base font-semibold text-gray-900">At-Risk of Stockout</h3>
-                  <span className="text-xs text-gray-600">{fmt.format(atRisk.length)} items</span>
+                  <div>
+                    <h3 className="text-base font-semibold text-gray-900">At-Risk of Stockout</h3>
+                    <p className="text-xs text-gray-600">
+                      Page {data.atRisk.page} of {data.atRisk.pages} &middot; {fmt.format(data.atRisk.total)} total
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button size="sm" variant="secondary" disabled={!canPrev} onClick={() => setPage(p => Math.max(1, p - 1))}>
+                      Prev
+                    </Button>
+                    <Button size="sm" variant="secondary" disabled={!canNext} onClick={() => setPage(p => p + 1)}>
+                      Next
+                    </Button>
+                  </div>
                 </div>
               </CardHeader>
               <CardContent>
@@ -139,9 +160,9 @@ export default function Dashboard() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {atRisk.map((r, i) => (
+                      {(data.atRisk.items ?? []).map((r, i) => (
                         <TableRow key={r.product_id}>
-                          <TableCell>{i + 1}</TableCell>
+                          <TableCell>{(data.atRisk.page - 1) * data.atRisk.pageSize + i + 1}</TableCell>
                           <TableCell className="font-medium whitespace-normal break-words">
                             <div className="text-[13px] leading-tight line-clamp-2">
                               {r.product_name}
@@ -163,7 +184,7 @@ export default function Dashboard() {
                           </TableCell>
                         </TableRow>
                       ))}
-                      {atRisk.length === 0 && (
+                      {(data.atRisk.items ?? []).length === 0 && (
                         <TableRow>
                           <TableCell colSpan={6} className="text-center text-gray-500">No at-risk items.</TableCell>
                         </TableRow>
@@ -174,57 +195,7 @@ export default function Dashboard() {
               </CardContent>
             </Card>
 
-            {/* Top Products — compact table */}
-            <Card>
-              <CardHeader>
-                <h3 className="text-base font-semibold text-gray-900">Top Products (last 12 months)</h3>
-              </CardHeader>
-              <CardContent>
-                <div className="text-sm">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead className="w-10">#</TableHead>
-                        <TableHead className="max-w-[280px]">Product</TableHead>
-                        <TableHead className="text-right w-20">Qty</TableHead>
-                        <TableHead className="text-right w-28">Revenue</TableHead>
-                        <TableHead className="text-right w-32">Gross Profit</TableHead>
-                        <TableHead className="text-right w-24">Actions</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {(data.topProducts ?? []).map((p, i) => (
-                        <TableRow key={p.product_id}>
-                          <TableCell>{i + 1}</TableCell>
-                          <TableCell className="font-medium whitespace-normal break-words">
-                            <div className="text-[13px] leading-tight line-clamp-2">
-                              {p.product_name}
-                            </div>
-                          </TableCell>
-                          <TableCell className="text-right">{fmt.format(p.qty_12m)}</TableCell>
-                          <TableCell className="text-right">$ {money(p.revenue_12m)}</TableCell>
-                          <TableCell className="text-right">$ {money(p.gross_profit_12m)}</TableCell>
-                          <TableCell className="text-right">
-                            <Button
-                              size="sm"
-                              variant="secondary"
-                              onClick={() => navigate(`/products/${p.product_id}`)}
-                            >
-                              View
-                            </Button>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                      {(data.topProducts ?? []).length === 0 && (
-                        <TableRow>
-                          <TableCell colSpan={6} className="text-center text-gray-500">No products.</TableCell>
-                        </TableRow>
-                      )}
-                    </TableBody>
-                  </Table>
-                </div>
-              </CardContent>
-            </Card>
+            {/* Top Products section removed per spec */}
           </>
         )}
       </div>
