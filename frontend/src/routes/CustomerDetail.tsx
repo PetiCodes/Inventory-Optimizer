@@ -14,13 +14,22 @@ type Summary = {
   distinct_products: number
   first_date: string | null
   last_date: string | null
+  total_revenue?: number
+  total_gross_profit?: number
 }
-type ProductRow = { product_id: string; product_name: string; qty: number }
+
+type ProductRow = {
+  product_id: string
+  product_name: string
+  qty: number
+  revenue?: number
+  gross_profit?: number
+}
 
 type ApiResp = {
   customer: { id: string; name: string }
   summary: Summary
-  monthly?: { month: string; qty: number }[] // in case /overview also returns it
+  monthly?: { month: string; qty: number }[]
   products: ProductRow[]
 }
 
@@ -67,11 +76,9 @@ export default function CustomerDetail() {
         )
         const json: ApiResp | { error?: string } = await res.json()
         if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`)
-
         const api = json as ApiResp
         setData(api)
 
-        // If overview already included monthly, pre-fill the chart for immediate paint
         if (api.monthly?.length) {
           setMonthly(
             api.monthly.map((m) => ({
@@ -80,7 +87,7 @@ export default function CustomerDetail() {
             }))
           )
         } else {
-          setMonthly([]) // will be filled by the monthly call below
+          setMonthly([])
         }
       } catch (e: any) {
         setErr(e.message || 'Failed to load customer')
@@ -91,7 +98,7 @@ export default function CustomerDetail() {
     })()
   }, [id])
 
-  // Load monthly series using the new endpoint & mode/year controls
+  // Load monthly series
   async function loadMonthly() {
     if (!id) return
     setMonthlyErr(null)
@@ -125,6 +132,10 @@ export default function CustomerDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, mode, year])
 
+  // Formatters
+  const fmtMoney = (n?: number) =>
+    n == null ? '—' : n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
   return (
     <AppShell>
       <div className="space-y-6">
@@ -145,7 +156,7 @@ export default function CustomerDetail() {
             </div>
 
             {/* KPIs */}
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-6 gap-6">
               <Card>
                 <CardContent className="p-6">
                   <p className="text-sm text-gray-600">Total Qty Purchased</p>
@@ -175,6 +186,24 @@ export default function CustomerDetail() {
                   <p className="text-sm text-gray-600">Last Purchase</p>
                   <p className="text-2xl font-bold text-gray-900">
                     {data.summary.last_date ?? '—'}
+                  </p>
+                </CardContent>
+              </Card>
+
+              {/* NEW: Totals */}
+              <Card>
+                <CardContent className="p-6">
+                  <p className="text-sm text-gray-600">Total Revenue</p>
+                  <p className="text-2xl font-bold text-gray-900">
+                    {fmtMoney(data.summary.total_revenue)}
+                  </p>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardContent className="p-6">
+                  <p className="text-sm text-gray-600">Total Gross Profit</p>
+                  <p className="text-2xl font-bold text-gray-900">
+                    {fmtMoney(data.summary.total_gross_profit)}
                   </p>
                 </CardContent>
               </Card>
@@ -239,7 +268,7 @@ export default function CustomerDetail() {
                         <XAxis dataKey="label" />
                         <YAxis />
                         <Tooltip />
-                        <Line type="monotone" dataKey="total_qty" dot={false} stroke="#2563eb" />
+                        <Line type="monotone" dataKey="total_qty" dot={false} />
                       </LineChart>
                     </ResponsiveContainer>
                   )}
@@ -247,7 +276,7 @@ export default function CustomerDetail() {
               </CardContent>
             </Card>
 
-            {/* Products purchased */}
+            {/* Products purchased (now with Revenue & GP) */}
             <Card>
               <CardHeader>
                 <h3 className="text-lg font-semibold text-gray-900">Products Purchased</h3>
@@ -259,6 +288,8 @@ export default function CustomerDetail() {
                       <TableHead className="w-[60px]">#</TableHead>
                       <TableHead>Product</TableHead>
                       <TableHead className="text-right">Total Qty</TableHead>
+                      <TableHead className="text-right">Revenue</TableHead>
+                      <TableHead className="text-right">Gross Profit</TableHead>
                       <TableHead className="text-right w-[130px]">Actions</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -269,6 +300,12 @@ export default function CustomerDetail() {
                         <TableCell className="font-medium">{p.product_name}</TableCell>
                         <TableCell className="text-right">
                           {Number(p.qty || 0).toLocaleString()}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {fmtMoney(p.revenue)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {fmtMoney(p.gross_profit)}
                         </TableCell>
                         <TableCell className="text-right">
                           <Button
@@ -283,7 +320,7 @@ export default function CustomerDetail() {
                     ))}
                     {(data.products ?? []).length === 0 && (
                       <TableRow>
-                        <TableCell colSpan={4} className="text-center text-gray-500">
+                        <TableCell colSpan={6} className="text-center text-gray-500">
                           No purchases found.
                         </TableCell>
                       </TableRow>
