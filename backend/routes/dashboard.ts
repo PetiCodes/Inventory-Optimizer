@@ -56,6 +56,7 @@ type SaleRow = { product_id: string; date: string; quantity: number; unit_price:
 
 const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
+const ORDER_COVERAGE_MONTHS = 4  // ← use 4-month coverage for MOQ
 
 /** ───────────── Route ───────────── */
 router.get('/dashboard/overview', async (req, res) => {
@@ -155,7 +156,8 @@ router.get('/dashboard/overview', async (req, res) => {
       if (!isUUID(pid)) continue
       const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
       const weightedSum = arr.reduce((sum, q, i) => sum + q * weights12[i], 0)
-      const weighted_moq = Math.ceil(wSum12 ? (weightedSum / wSum12) : 0)
+      const weightedAvg = wSum12 ? (weightedSum / wSum12) : 0
+      const weighted_moq = Math.ceil(weightedAvg * ORDER_COVERAGE_MONTHS) // ← FIX
       const onHand = onHandMap.get(pid) ?? 0
       const gap = Math.max(0, weighted_moq - onHand)
       if (gap > 0) {
