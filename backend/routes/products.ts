@@ -173,7 +173,7 @@ router.get('/products/list', async (req, res) => {
  *
  * Cycle 2:
  *  - Accurate gross profit using historical cost-at-sale-date.
- *  - Added `customers` (all customers in the window), ranked by qty desc.
+ *  - Full customers list for the selected window (aggregated in Node).
  */
 router.get('/products/:id/overview', async (req, res) => {
   try {
@@ -326,20 +326,26 @@ router.get('/products/:id/overview', async (req, res) => {
     const topRes = await supabaseService.rpc('product_top_customers', { p_product_id: productId, p_limit: top })
     if (topRes.error) return res.status(500).json({ error: topRes.error.message })
 
-    // All customers in window: aggregate qty by customer_id
-    const allCustAgg = await supabaseService
+    // ---------- All customers in the selected window (aggregate in Node) ----------
+    const salesCust = await supabaseService
       .from('sales')
-      .select('customer_id, qty:quantity.sum()')
+      .select('customer_id, quantity')
       .eq('product_id', productId)
       .gte('date', rangeStartISO)
       .lte('date', rangeEndISO)
-      .order('qty', { ascending: false })
 
-    if (allCustAgg.error) {
-      return res.status(500).json({ error: allCustAgg.error.message })
+    if (salesCust.error) {
+      return res.status(500).json({ error: salesCust.error.message })
     }
 
-    const allIds = (allCustAgg.data ?? []).map((r: any) => String(r.customer_id))
+    const qtyByCustomer = new Map<string, number>()
+    for (const r of salesCust.data ?? []) {
+      const cid = String((r as any).customer_id)
+      const q = Number((r as any).quantity ?? 0)
+      qtyByCustomer.set(cid, (qtyByCustomer.get(cid) || 0) + q)
+    }
+
+    const allIds = Array.from(qtyByCustomer.keys())
     let nameMap = new Map<string, string>()
     if (allIds.length) {
       const names = await supabaseService.from('customers').select('id,name').in('id', allIds)
@@ -347,11 +353,13 @@ router.get('/products/:id/overview', async (req, res) => {
       for (const c of names.data ?? []) nameMap.set(String(c.id), String(c.name ?? ''))
     }
 
-    const customersAll = (allCustAgg.data ?? []).map((r: any) => ({
-      customer_id: String(r.customer_id),
-      customer_name: (nameMap.get(String(r.customer_id)) || '').trim() || '(unknown customer)',
-      qty: Number(r.qty ?? 0),
-    }))
+    const customersAll = allIds
+      .map((cid) => ({
+        customer_id: cid,
+        customer_name: (nameMap.get(cid) || '').trim() || '(unknown customer)',
+        qty: qtyByCustomer.get(cid) ?? 0,
+      }))
+      .sort((a, b) => b.qty - a.qty)
 
     return res.json({
       product: prod.data,
