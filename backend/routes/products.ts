@@ -45,7 +45,7 @@ const ORDER_COVERAGE_MONTHS = 4
 router.get('/products/search', async (req, res) => {
   try {
     const q = String(req.query.q ?? '').trim()
-    the const limit = Math.max(1, Math.min(Number(req.query.limit ?? 50), 200))
+    const limit = Math.max(1, Math.min(Number(req.query.limit ?? 50), 200))
     let query = supabaseService
       .from('products')
       .select('id,name')
@@ -326,8 +326,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const topRes = await supabaseService.rpc('product_top_customers', { p_product_id: productId, p_limit: top })
     if (topRes.error) return res.status(500).json({ error: topRes.error.message })
 
-    // -------------------- FIXED: All customers aggregation (no .group()) --------------------
-    // Use PostgREST aggregate in select(): qty:quantity.sum() + non-aggregated customer_id
+    // All customers in window: aggregate qty by customer_id
     const allCustAgg = await supabaseService
       .from('sales')
       .select('customer_id, qty:quantity.sum()')
@@ -363,7 +362,7 @@ router.get('/products/:id/overview', async (req, res) => {
         customer_name: r.customer_name,
         qty: Number(r.qty) || 0,
       })),
-      customers: customersAll, // full list
+      customers: customersAll, // full list in the selected window
       pricing: {
         average_selling_price: aspWeighted,
         current_unit_cost: unit_cost_now,
@@ -375,7 +374,7 @@ router.get('/products/:id/overview', async (req, res) => {
         total_qty: gpAccumulator.qty,
         total_revenue: gpAccumulator.revenue,
         unit_cost_used: undefined, // per-sale historical costs
-        gross_profit,              // true GP
+        gross_profit,              // true GP (not revenue)
       },
       stats12: {
         weighted_avg_12m: weightedAvg12,
