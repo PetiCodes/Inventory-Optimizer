@@ -45,7 +45,7 @@ const ORDER_COVERAGE_MONTHS = 4
 router.get('/products/search', async (req, res) => {
   try {
     const q = String(req.query.q ?? '').trim()
-    const limit = Math.max(1, Math.min(Number(req.query.limit ?? 50), 200))
+    the const limit = Math.max(1, Math.min(Number(req.query.limit ?? 50), 200))
     let query = supabaseService
       .from('products')
       .select('id,name')
@@ -171,10 +171,9 @@ router.get('/products/list', async (req, res) => {
  *    year=YYYY   (required if mode=year)
  *    top=1..5
  *
- * Notes for Cycle 2:
- *  - Gross profit is computed correctly using historical cost-at-sale-date.
- *  - Added `customers` array = **all customers** for the same window, ranked by qty desc.
- *    (Kept existing `topCustomers` for backward-compat.)
+ * Cycle 2:
+ *  - Accurate gross profit using historical cost-at-sale-date.
+ *  - Added `customers` (all customers in the window), ranked by qty desc.
  */
 router.get('/products/:id/overview', async (req, res) => {
   try {
@@ -191,7 +190,7 @@ router.get('/products/:id/overview', async (req, res) => {
       .single()
     if (prod.error || !prod.data) return res.status(404).json({ error: 'Product not found' })
 
-    // Build the time window + X-axis scaffold for the chart
+    // Time window
     let scaffold: { key: string; y: number; m0: number }[]
     let rangeStartISO: string
     let rangeEndISO: string
@@ -208,7 +207,7 @@ router.get('/products/:id/overview', async (req, res) => {
       rangeEndISO = monthEndUTC(last.y, last.m0).toISOString().slice(0, 10)
     }
 
-    // 1) Pull sales within the chosen range
+    // Sales for the window
     const salesQ = await supabaseService
       .from('sales')
       .select('date, quantity, unit_price, customer_id')
@@ -225,7 +224,7 @@ router.get('/products/:id/overview', async (req, res) => {
       customer_id: String(r.customer_id),
     }))
 
-    // 2) Pull all price records up to the end of range, then scan to find cost-at-sale-date
+    // Price points up to end of window
     const pricesQ = await supabaseService
       .from('product_prices')
       .select('effective_date, unit_cost')
@@ -239,7 +238,7 @@ router.get('/products/:id/overview', async (req, res) => {
       cost: Number(p.unit_cost ?? 0),
     }))
 
-    // Use latest cost with effective_date <= sale.date; if none, use 0.
+    // Gross profit using historical cost-at-sale-date
     let pi = -1
     let currentCost = 0
     const gpAccumulator = { qty: 0, revenue: 0, cost: 0 }
@@ -260,7 +259,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const gross_profit = gpAccumulator.revenue - gpAccumulator.cost
     const aspWeighted = gpAccumulator.qty > 0 ? gpAccumulator.revenue / gpAccumulator.qty : 0
 
-    // 3) Build monthly series (qty) for the chart from the same sales set
+    // Monthly series (qty)
     const monthMap = new Map<string, number>()
     for (const s of sales) {
       const d = new Date(s.date + 'T00:00:00Z')
@@ -272,7 +271,7 @@ router.get('/products/:id/overview', async (req, res) => {
       qty: monthMap.get(s.key) ?? 0,
     }))
 
-    // 4) stats12: ALWAYS last 12 months ending this month
+    // stats12
     const s12Scaffold = lastNMonthsScaffold(12)
     const s12StartISO = monthStartUTC(s12Scaffold[0].y, s12Scaffold[0].m0).toISOString().slice(0, 10)
     const s12EndISO = monthEndUTC(
@@ -302,7 +301,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const sigma12 = stddev(buckets12.map(r => r.qty))
     const weighted_moq = Math.ceil(weightedAvg12 * ORDER_COVERAGE_MONTHS)
 
-    // 5) Inventory & current price (info only)
+    // Inventory & current price
     const inv = await supabaseService
       .from('inventory_current')
       .select('on_hand, backorder')
@@ -320,21 +319,21 @@ router.get('/products/:id/overview', async (req, res) => {
     const unit_cost_now = Number(priceNow.data?.unit_cost ?? 0)
     const unit_price_now = Number(priceNow.data?.unit_price ?? 0)
 
-    // 6) Seasonality & classic "top" customers (kept for compatibility)
+    // Seasonality & legacy top customers
     const seas = await supabaseService.rpc('product_seasonality_last12', { p_product_id: productId })
     if (seas.error) return res.status(500).json({ error: seas.error.message })
 
     const topRes = await supabaseService.rpc('product_top_customers', { p_product_id: productId, p_limit: top })
     if (topRes.error) return res.status(500).json({ error: topRes.error.message })
 
-    // 7) NEW: All customers for this product in the same window (ranked by qty desc)
+    // -------------------- FIXED: All customers aggregation (no .group()) --------------------
+    // Use PostgREST aggregate in select(): qty:quantity.sum() + non-aggregated customer_id
     const allCustAgg = await supabaseService
       .from('sales')
-      .select('customer_id, qty:sum(quantity)')
+      .select('customer_id, qty:quantity.sum()')
       .eq('product_id', productId)
       .gte('date', rangeStartISO)
       .lte('date', rangeEndISO)
-      .group('customer_id')
       .order('qty', { ascending: false })
 
     if (allCustAgg.error) {
@@ -364,7 +363,7 @@ router.get('/products/:id/overview', async (req, res) => {
         customer_name: r.customer_name,
         qty: Number(r.qty) || 0,
       })),
-      customers: customersAll, // <-- NEW full list for the UI
+      customers: customersAll, // full list
       pricing: {
         average_selling_price: aspWeighted,
         current_unit_cost: unit_cost_now,
@@ -376,7 +375,7 @@ router.get('/products/:id/overview', async (req, res) => {
         total_qty: gpAccumulator.qty,
         total_revenue: gpAccumulator.revenue,
         unit_cost_used: undefined, // per-sale historical costs
-        gross_profit,              // <-- TRUE gross profit
+        gross_profit,              // true GP
       },
       stats12: {
         weighted_avg_12m: weightedAvg12,
