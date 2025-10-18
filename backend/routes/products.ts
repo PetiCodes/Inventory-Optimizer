@@ -51,13 +51,6 @@ router.get('/products/search', async (req, res) => {
 })
 
 /* --------------------------- PRODUCT OVERVIEW --------------------------- */
-/**
- * GET /api/products/:id/overview
- *  Query:
- *    mode=last12 | year
- *    year=YYYY   (required if mode=year)
- *    top=1..5    (kept for backward compatibility; we now also return allCustomers)
- */
 router.get('/products/:id/overview', async (req, res) => {
   try {
     const productId = String(req.params.id)
@@ -86,10 +79,10 @@ router.get('/products/:id/overview', async (req, res) => {
       rangeEndISO = monthEndUTC(last.y, last.m0).toISOString().slice(0, 10)
     }
 
-    // 1) Pull sales within the chosen range
+    // 1) Pull sales within the chosen range (include customer_id so we can aggregate in code)
     const salesQ = await supabaseService
       .from('sales')
-      .select('date, quantity, unit_price')
+      .select('date, quantity, unit_price, customer_id')
       .eq('product_id', productId)
       .gte('date', rangeStartISO)
       .lte('date', rangeEndISO)
@@ -98,10 +91,11 @@ router.get('/products/:id/overview', async (req, res) => {
     const sales = (salesQ.data ?? []).map(r => ({
       date: String(r.date),
       qty: Number(r.quantity ?? 0),
-      unit_price: Number(r.unit_price ?? 0)
+      unit_price: Number(r.unit_price ?? 0),
+      customer_id: String(r.customer_id ?? '')
     }))
 
-    // 2) Costs up to end of range (to compute GP using cost at/ before sale date)
+    // 2) Costs up to end of range (for accurate GP)
     const pricesQ = await supabaseService
       .from('product_prices')
       .select('effective_date, unit_cost')
@@ -128,7 +122,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const gross_profit = gpAccumulator.revenue - gpAccumulator.cost
     const aspWeighted = gpAccumulator.qty > 0 ? gpAccumulator.revenue / gpAccumulator.qty : 0
 
-    // 3) Build monthly qty series for chart
+    // 3) Monthly qty series
     const monthMap = new Map<string, number>()
     for (const s of sales) {
       const d = new Date(s.date + 'T00:00:00Z')
@@ -179,34 +173,32 @@ router.get('/products/:id/overview', async (req, res) => {
     const unit_cost_now = Number(priceNow.data?.unit_cost ?? 0)
     const unit_price_now = Number(priceNow.data?.unit_price ?? 0)
 
-    // 6) Seasonality & legacy “top” customers (still returned)
+    // 6) Seasonality & legacy top customers
     const seas = await supabaseService.rpc('product_seasonality_last12', { p_product_id: productId })
     if (seas.error) return res.status(500).json({ error: seas.error.message })
     const topRes = await supabaseService.rpc('product_top_customers', { p_product_id: productId, p_limit: top })
     if (topRes.error) return res.status(500).json({ error: topRes.error.message })
 
-    // 7) NEW: All customers for this product in the selected window (quantity aggregated)
-    const aggQ = await supabaseService
-      .from('sales')
-      .select('customer_id, qty:sum(quantity)')
-      .eq('product_id', productId)
-      .gte('date', rangeStartISO)
-      .lte('date', rangeEndISO)
-      .group('customer_id')
-      .order('qty', { ascending: false })
-    if (aggQ.error) return res.status(500).json({ error: aggQ.error.message })
-    const allCustIds = (aggQ.data ?? []).map((r: any) => String(r.customer_id))
+    // 7) NEW: All customers for this window — aggregate in Node
+    const qtyByCustomer = new Map<string, number>()
+    for (const s of sales) {
+      if (!s.customer_id) continue
+      qtyByCustomer.set(s.customer_id, (qtyByCustomer.get(s.customer_id) ?? 0) + s.qty)
+    }
+    const allCustIds = Array.from(qtyByCustomer.keys())
     let nameMap = new Map<string, string>()
     if (allCustIds.length) {
       const nQ = await supabaseService.from('customers').select('id,name').in('id', allCustIds)
       if (nQ.error) return res.status(500).json({ error: nQ.error.message })
       for (const c of nQ.data ?? []) nameMap.set(String(c.id), String(c.name ?? ''))
     }
-    const allCustomers = (aggQ.data ?? []).map((r: any) => ({
-      customer_id: String(r.customer_id),
-      customer_name: (nameMap.get(String(r.customer_id)) || '').trim() || '(unknown customer)',
-      qty: Number(r.qty ?? 0)
-    }))
+    const allCustomers = allCustIds
+      .map(id => ({
+        customer_id: id,
+        customer_name: (nameMap.get(id) || '').trim() || '(unknown customer)',
+        qty: Number(qtyByCustomer.get(id) ?? 0)
+      }))
+      .sort((a, b) => b.qty - a.qty)
 
     return res.json({
       product: prod.data,
@@ -217,7 +209,7 @@ router.get('/products/:id/overview', async (req, res) => {
         customer_name: r.customer_name,
         qty: Number(r.qty) || 0
       })),
-      allCustomers, // <- NEW full list for the window
+      allCustomers,
       pricing: {
         average_selling_price: aspWeighted,
         current_unit_cost: unit_cost_now,
@@ -228,7 +220,7 @@ router.get('/products/:id/overview', async (req, res) => {
         year: mode === 'year' ? year : undefined,
         total_qty: gpAccumulator.qty,
         total_revenue: gpAccumulator.revenue,
-        unit_cost_used: undefined, // per-sale historical costs
+        unit_cost_used: undefined,
         gross_profit
       },
       stats12: {
