@@ -58,8 +58,14 @@ const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
 
 /** ───────────── Route ───────────── */
-router.get('/dashboard/overview', async (_req, res) => {
+router.get('/dashboard/overview', async (req, res) => {
   try {
+    // pagination for At-Risk
+    const page = Math.max(1, Number(req.query.page ?? 1))
+    const pageSize = Math.max(1, Math.min(Number(req.query.pageSize ?? 20), 200))
+    const from = (page - 1) * pageSize
+    const to = from + pageSize
+
     // 1) Totals (counts)
     const prodHead = await supabaseService.from('products').select('id', { count: 'exact', head: true })
     if (prodHead.error) return res.status(500).json({ error: prodHead.error.message })
@@ -72,7 +78,7 @@ router.get('/dashboard/overview', async (_req, res) => {
     // 2) KPI totals (as requested)
     const { startISO, endISO } = last12WindowUTC()
 
-    // Revenue = sum of revenue_12m from product_kpis_12m (assumes one row per product with the latest 12M)
+    // Revenue = sum of revenue_12m from product_kpis_12m
     const revQ = await supabaseService.from('product_kpis_12m').select('revenue_12m')
     if (revQ.error) {
       console.error('[dashboard] revenue from product_kpis_12m error:', revQ.error)
@@ -82,7 +88,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       (s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0
     )
 
-    // Sales Qty = sum of the last 12 rows from v_sales_monthly_total in the month window
+    // Sales Qty = sum of the last-12 months from v_sales_monthly_total
     const qtyQ = await supabaseService
       .from('v_sales_monthly_total')
       .select('month,total_qty')
@@ -96,7 +102,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       (s: number, r: any) => s + Number(r.total_qty ?? 0), 0
     )
 
-    // 3) Build monthly buckets for At-Risk (use raw sales just for this)
+    // 3) Build monthly buckets for At-Risk
     const sQ = await supabaseService
       .from('sales')
       .select('product_id, date, quantity, unit_price')
@@ -133,7 +139,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       (invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)])
     )
 
-    // 5) Compute At-Risk rows (WITHOUT names)
+    // 5) Compute At-Risk rows (all, sorted by gap DESC)
     type AtRiskRow = {
       product_id: string
       on_hand: number
@@ -144,7 +150,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       ...Array.from(perProdMonthly.keys()),
       ...Array.from(onHandMap.keys()),
     ])
-    const atRiskRaw: AtRiskRow[] = []
+    const atRiskAll: AtRiskRow[] = []
     for (const pid of pidSet) {
       if (!isUUID(pid)) continue
       const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
@@ -153,14 +159,16 @@ router.get('/dashboard/overview', async (_req, res) => {
       const onHand = onHandMap.get(pid) ?? 0
       const gap = Math.max(0, weighted_moq - onHand)
       if (gap > 0) {
-        atRiskRaw.push({ product_id: pid, on_hand: onHand, weighted_moq, gap })
+        atRiskAll.push({ product_id: pid, on_hand: onHand, weighted_moq, gap })
       }
     }
-    atRiskRaw.sort((a, b) => b.gap - a.gap)
-    const atRiskTop20 = atRiskRaw.slice(0, 20)
+    atRiskAll.sort((a, b) => b.gap - a.gap)
 
-    // 6) Fetch names ONLY for the At-Risk Top 20
-    const atRiskIds = atRiskTop20.map(r => r.product_id).filter(isUUID)
+    const totalAtRisk = atRiskAll.length
+    const pageSlice = atRiskAll.slice(from, to)
+
+    // 6) Fetch names ONLY for the current page
+    const atRiskIds = pageSlice.map(r => r.product_id).filter(isUUID)
     let nameMap = new Map<string, string>()
     if (atRiskIds.length > 0) {
       for (const part of chunk(atRiskIds, 200)) {
@@ -174,7 +182,7 @@ router.get('/dashboard/overview', async (_req, res) => {
         }
       }
     }
-    const atRisk = atRiskTop20.map(r => ({
+    const atRiskPage = pageSlice.map(r => ({
       product_id: r.product_id,
       product_name: (nameMap.get(r.product_id) || '').trim() || '(unknown product)',
       on_hand: r.on_hand,
@@ -182,67 +190,7 @@ router.get('/dashboard/overview', async (_req, res) => {
       gap: r.gap,
     }))
 
-    // 7) Top Products — rank strictly by gross_profit_12m DESC (prefer view)
-    let topProducts: Array<{
-      product_id: string
-      product_name: string
-      qty_12m: number
-      revenue_12m: number
-      gross_profit_12m: number
-    }> = []
-
-    const viewQ = await supabaseService
-      .from('v_product_profit_cache')
-      .select('product_id, product_name, qty_12m, revenue_12m, gross_profit_12m')
-      .order('gross_profit_12m', { ascending: false })
-      .limit(20)
-
-    if (!viewQ.error) {
-      topProducts = (viewQ.data ?? []).map((r: any) => ({
-        product_id: String(r.product_id),
-        product_name: String(r.product_name ?? '').trim() || '(unknown product)',
-        qty_12m: Number(r.qty_12m ?? 0),
-        revenue_12m: Number(r.revenue_12m ?? 0),
-        gross_profit_12m: Number(r.gross_profit_12m ?? 0),
-      }))
-    } else {
-      // Fallback to the table + name lookup (still sorted by GP DESC)
-      console.warn('[dashboard] falling back to product_profit_cache table:', viewQ.error)
-      const tblQ = await supabaseService
-        .from('product_profit_cache')
-        .select('product_id, qty_12m, revenue_12m, gross_profit_12m')
-        .order('gross_profit_12m', { ascending: false })
-        .limit(20)
-      if (tblQ.error) {
-        console.error('[dashboard] product_profit_cache fallback error:', tblQ.error)
-        return res.status(500).json({ error: tblQ.error.message })
-      }
-
-      const ids = (tblQ.data ?? []).map((r: any) => String(r.product_id)).filter(isUUID)
-      let topNameMap = new Map<string, string>()
-      if (ids.length > 0) {
-        for (const part of chunk(ids, 200)) {
-          const nQ = await supabaseService.from('products').select('id,name').in('id', part)
-          if (nQ.error) {
-            console.error('[dashboard] name lookup (top) error:', nQ.error)
-            return res.status(500).json({ error: nQ.error.message })
-          }
-          for (const p of nQ.data ?? []) {
-            topNameMap.set(String(p.id), String(p.name ?? ''))
-          }
-        }
-      }
-
-      topProducts = (tblQ.data ?? []).map((r: any) => ({
-        product_id: String(r.product_id),
-        product_name: (topNameMap.get(String(r.product_id)) || '').trim() || '(unknown product)',
-        qty_12m: Number(r.qty_12m ?? 0),
-        revenue_12m: Number(r.revenue_12m ?? 0),
-        gross_profit_12m: Number(r.gross_profit_12m ?? 0),
-      }))
-    }
-
-    // 8) Respond
+    // 7) Respond (topProducts removed; kept as [] for backward-compat)
     return res.json({
       totals: {
         products: productsCount,
@@ -250,8 +198,14 @@ router.get('/dashboard/overview', async (_req, res) => {
         sales_12m_qty,
         sales_12m_revenue,
       },
-      atRisk,
-      topProducts,
+      atRisk: {
+        page,
+        pageSize,
+        total: totalAtRisk,
+        pages: Math.max(1, Math.ceil(totalAtRisk / pageSize)),
+        items: atRiskPage,
+      },
+      topProducts: [], // deprecated
     })
   } catch (e: any) {
     console.error('GET /dashboard/overview error:', e)
