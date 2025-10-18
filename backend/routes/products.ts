@@ -37,10 +37,10 @@ function stddev(nums: number[]): number {
 }
 const ORDER_COVERAGE_MONTHS = 4
 
-/* ------------------------------ SEARCH ROUTE ------------------------------ */
+/* ------------------------------ SIMPLE SEARCH ------------------------------ */
 /**
  * GET /api/products/search?q=...&limit=20
- * Used by your Products list page. Returns id & name.
+ * (Kept for compatibility; not used by the new Products page list.)
  */
 router.get('/products/search', async (req, res) => {
   try {
@@ -58,6 +58,113 @@ router.get('/products/search', async (req, res) => {
     if (error) return res.status(500).json({ error: error.message })
     return res.json({ results: data ?? [] })
   } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'Server error' })
+  }
+})
+
+/* ----------------------- PAGINATED GP-RANKED LIST ----------------------- */
+/**
+ * GET /api/products/list
+ * Query:
+ *   page=1 (1-based)
+ *   limit=20
+ *   q=search string (matches product name)
+ *   order=gp_desc | gp_asc   (default gp_desc)
+ *
+ * Returns rows ranked by 12m Gross Profit from v_product_profit_cache (preferred)
+ * or falls back to product_profit_cache + names.
+ */
+router.get('/products/list', async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page ?? 1))
+    const limit = Math.max(1, Math.min(Number(req.query.limit ?? 20), 200))
+    const orderParam = String(req.query.order ?? 'gp_desc')
+    const ascending = orderParam === 'gp_asc'
+    const q = String(req.query.q ?? '').trim()
+
+    const from = (page - 1) * limit
+    const to = from + limit - 1
+
+    // Try the convenience view first (already includes product_name)
+    let view = await supabaseService
+      .from('v_product_profit_cache')
+      .select('product_id,product_name,qty_12m,revenue_12m,gross_profit_12m', { count: 'exact' })
+
+    if (q) view = view.ilike('product_name', `%${q}%`)
+    view = view.order('gross_profit_12m', { ascending })
+    view = view.range(from, to)
+
+    const viewRes = await view
+
+    if (!viewRes.error) {
+      const total = viewRes.count ?? (viewRes.data?.length ?? 0)
+      const items = (viewRes.data ?? []).map((r: any) => ({
+        id: String(r.product_id),
+        name: String(r.product_name ?? '').trim() || '(unknown product)',
+        qty_12m: Number(r.qty_12m ?? 0),
+        revenue_12m: Number(r.revenue_12m ?? 0),
+        gross_profit_12m: Number(r.gross_profit_12m ?? 0)
+      }))
+      return res.json({
+        page,
+        limit,
+        total,
+        pages: Math.max(1, Math.ceil(total / limit)),
+        items
+      })
+    }
+
+    // ---- Fallback: product_profit_cache + names from products ----
+    // Step 1: filter by q using product name -> ids (if q provided)
+    let idFilter: string[] | null = null
+    if (q) {
+      const nameRes = await supabaseService
+        .from('products')
+        .select('id,name')
+        .ilike('name', `%${q}%`)
+      if (nameRes.error) return res.status(500).json({ error: nameRes.error.message })
+      idFilter = (nameRes.data ?? []).map(r => String(r.id))
+      if (idFilter.length === 0) {
+        return res.json({ page, limit, total: 0, pages: 1, items: [] })
+      }
+    }
+
+    let cacheQ = supabaseService
+      .from('product_profit_cache')
+      .select('product_id,qty_12m,revenue_12m,gross_profit_12m', { count: 'exact' })
+
+    if (idFilter) cacheQ = cacheQ.in('product_id', idFilter)
+    cacheQ = cacheQ.order('gross_profit_12m', { ascending }).range(from, to)
+
+    const cacheRes = await cacheQ
+    if (cacheRes.error) return res.status(500).json({ error: cacheRes.error.message })
+
+    const ids = (cacheRes.data ?? []).map(r => String(r.product_id))
+    let names = new Map<string, string>()
+    if (ids.length) {
+      const namesRes = await supabaseService.from('products').select('id,name').in('id', ids)
+      if (namesRes.error) return res.status(500).json({ error: namesRes.error.message })
+      for (const p of namesRes.data ?? []) names.set(String(p.id), String(p.name ?? ''))
+    }
+
+    const total = cacheRes.count ?? (cacheRes.data?.length ?? 0)
+    const items = (cacheRes.data ?? []).map((r: any) => ({
+      id: String(r.product_id),
+      name: (names.get(String(r.product_id)) || '').trim() || '(unknown product)',
+      qty_12m: Number(r.qty_12m ?? 0),
+      revenue_12m: Number(r.revenue_12m ?? 0),
+      gross_profit_12m: Number(r.gross_profit_12m ?? 0)
+    }))
+
+    return res.json({
+      page,
+      limit,
+      total,
+      pages: Math.max(1, Math.ceil(total / limit)),
+      items
+    })
+  } catch (e: any) {
+    console.error('GET /products/list error:', e)
     return res.status(500).json({ error: e?.message || 'Server error' })
   }
 })
@@ -132,14 +239,12 @@ router.get('/products/:id/overview', async (req, res) => {
       cost: Number(p.unit_cost ?? 0)
     }))
 
-    // FIX: do NOT default to the first cost (it may be after the sale date).
     // Use latest cost with effective_date <= sale.date; if none, use 0.
-    let pi = -1 // points to the last price with eff <= current sale date
+    let pi = -1
     let currentCost = 0
     const gpAccumulator = { qty: 0, revenue: 0, cost: 0 }
 
     for (const s of sales) {
-      // advance pointer while the next price takes effect on/before the sale date
       while (pi + 1 < pricePoints.length && pricePoints[pi + 1].eff <= s.date) {
         pi++
         currentCost = pricePoints[pi].cost
@@ -190,7 +295,7 @@ router.get('/products/:id/overview', async (req, res) => {
       const b = buckets12.find(x => x.key === key)
       if (b) b.qty += Number(r.quantity ?? 0)
     }
-    const weights = buckets12.map((_, i) => i + 1) // 1..12 (recent has highest)
+    const weights = buckets12.map((_, i) => i + 1)
     const wSum = weights.reduce((a, b) => a + b, 0)
     const weightedSum = buckets12.reduce((acc, r, i) => acc + r.qty * weights[i], 0)
     const weightedAvg12 = wSum ? weightedSum / wSum : 0
@@ -241,7 +346,7 @@ router.get('/products/:id/overview', async (req, res) => {
         year: mode === 'year' ? year : undefined,
         total_qty: gpAccumulator.qty,
         total_revenue: gpAccumulator.revenue,
-        unit_cost_used: undefined, // we used per-sale historical costs
+        unit_cost_used: undefined, // per-sale historical costs
         gross_profit
       },
       stats12: {
