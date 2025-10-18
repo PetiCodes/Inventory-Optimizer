@@ -70,9 +70,6 @@ router.get('/products/search', async (req, res) => {
  *   limit=20
  *   q=search string (matches product name)
  *   order=gp_desc | gp_asc   (default gp_desc)
- *
- * Returns rows ranked by 12m Gross Profit from v_product_profit_cache (preferred)
- * or falls back to product_profit_cache + names.
  */
 router.get('/products/list', async (req, res) => {
   try {
@@ -85,16 +82,15 @@ router.get('/products/list', async (req, res) => {
     const from = (page - 1) * limit
     const to = from + limit - 1
 
-    // Try the convenience view first (already includes product_name)
-    let view = await supabaseService
+    // ---- Preferred: use the view (already contains product_name) ----
+    let builder = supabaseService
       .from('v_product_profit_cache')
-      .select('product_id,product_name,qty_12m,revenue_12m,gross_profit_12m', { count: 'exact' })
+      .select('product_id, product_name, qty_12m, revenue_12m, gross_profit_12m', { count: 'exact' })
 
-    if (q) view = view.ilike('product_name', `%${q}%`)
-    view = view.order('gross_profit_12m', { ascending })
-    view = view.range(from, to)
+    if (q) builder = builder.ilike('product_name', `%${q}%`)
+    builder = builder.order('gross_profit_12m', { ascending }).range(from, to)
 
-    const viewRes = await view
+    const viewRes = await builder
 
     if (!viewRes.error) {
       const total = viewRes.count ?? (viewRes.data?.length ?? 0)
@@ -103,19 +99,18 @@ router.get('/products/list', async (req, res) => {
         name: String(r.product_name ?? '').trim() || '(unknown product)',
         qty_12m: Number(r.qty_12m ?? 0),
         revenue_12m: Number(r.revenue_12m ?? 0),
-        gross_profit_12m: Number(r.gross_profit_12m ?? 0)
+        gross_profit_12m: Number(r.gross_profit_12m ?? 0),
       }))
       return res.json({
         page,
         limit,
         total,
         pages: Math.max(1, Math.ceil(total / limit)),
-        items
+        items,
       })
     }
 
-    // ---- Fallback: product_profit_cache + names from products ----
-    // Step 1: filter by q using product name -> ids (if q provided)
+    // ---- Fallback: table + names ----
     let idFilter: string[] | null = null
     if (q) {
       const nameRes = await supabaseService
@@ -131,8 +126,7 @@ router.get('/products/list', async (req, res) => {
 
     let cacheQ = supabaseService
       .from('product_profit_cache')
-      .select('product_id,qty_12m,revenue_12m,gross_profit_12m', { count: 'exact' })
-
+      .select('product_id, qty_12m, revenue_12m, gross_profit_12m', { count: 'exact' })
     if (idFilter) cacheQ = cacheQ.in('product_id', idFilter)
     cacheQ = cacheQ.order('gross_profit_12m', { ascending }).range(from, to)
 
@@ -153,7 +147,7 @@ router.get('/products/list', async (req, res) => {
       name: (names.get(String(r.product_id)) || '').trim() || '(unknown product)',
       qty_12m: Number(r.qty_12m ?? 0),
       revenue_12m: Number(r.revenue_12m ?? 0),
-      gross_profit_12m: Number(r.gross_profit_12m ?? 0)
+      gross_profit_12m: Number(r.gross_profit_12m ?? 0),
     }))
 
     return res.json({
@@ -161,7 +155,7 @@ router.get('/products/list', async (req, res) => {
       limit,
       total,
       pages: Math.max(1, Math.ceil(total / limit)),
-      items
+      items,
     })
   } catch (e: any) {
     console.error('GET /products/list error:', e)
@@ -222,7 +216,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const sales = (salesQ.data ?? []).map(r => ({
       date: String(r.date),
       qty: Number(r.quantity ?? 0),
-      unit_price: Number(r.unit_price ?? 0)
+      unit_price: Number(r.unit_price ?? 0),
     }))
 
     // 2) Pull all price records up to the end of range, then scan to find cost-at-sale-date
@@ -236,7 +230,7 @@ router.get('/products/:id/overview', async (req, res) => {
     if (pricesQ.error) return res.status(500).json({ error: pricesQ.error.message })
     const pricePoints = (pricesQ.data ?? []).map(p => ({
       eff: String(p.effective_date),
-      cost: Number(p.unit_cost ?? 0)
+      cost: Number(p.unit_cost ?? 0),
     }))
 
     // Use latest cost with effective_date <= sale.date; if none, use 0.
@@ -269,7 +263,7 @@ router.get('/products/:id/overview', async (req, res) => {
     }
     const monthly = scaffold.map(s => ({
       month: `${s.key}-01`,
-      qty: monthMap.get(s.key) ?? 0
+      qty: monthMap.get(s.key) ?? 0,
     }))
 
     // 4) stats12: ALWAYS last 12 months ending this month
@@ -334,12 +328,12 @@ router.get('/products/:id/overview', async (req, res) => {
       topCustomers: (topRes.data ?? []).map((r: any) => ({
         customer_id: r.customer_id,
         customer_name: r.customer_name,
-        qty: Number(r.qty) || 0
+        qty: Number(r.qty) || 0,
       })),
       pricing: {
         average_selling_price: aspWeighted,
         current_unit_cost: unit_cost_now,
-        current_unit_price: unit_price_now
+        current_unit_price: unit_price_now,
       },
       profit_window: {
         mode,
@@ -347,14 +341,14 @@ router.get('/products/:id/overview', async (req, res) => {
         total_qty: gpAccumulator.qty,
         total_revenue: gpAccumulator.revenue,
         unit_cost_used: undefined, // per-sale historical costs
-        gross_profit
+        gross_profit,
       },
       stats12: {
         weighted_avg_12m: weightedAvg12,
         sigma_12m: sigma12,
-        weighted_moq
+        weighted_moq,
       },
-      inventory: { on_hand, backorder }
+      inventory: { on_hand, backorder },
     })
   } catch (e: any) {
     console.error('GET /products/:id/overview error:', e)
