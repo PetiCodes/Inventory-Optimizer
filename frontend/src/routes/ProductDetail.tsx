@@ -10,14 +10,14 @@ import Button from '../components/ui/Button'
 import { supabase } from '../lib/supabaseClient'
 
 type MonthlyPoint = { month: string; qty: number }
-type CustomerRow = { customer_id: string; customer_name: string; qty: number }
+type CustRow = { customer_id: string; customer_name: string; qty: number }
 
 type ApiResp = {
   product: { id: string; name: string }
   monthly: MonthlyPoint[]
   seasonality?: { month_num: number; avg_qty: number }[]
-  topCustomers?: CustomerRow[]
-  allCustomers?: CustomerRow[]           // <- NEW
+  topCustomers?: CustRow[]
+  customers?: CustRow[]            // <-- NEW (all customers)
   pricing?: {
     average_selling_price: number | null
     current_unit_cost: number | null
@@ -28,7 +28,7 @@ type ApiResp = {
     year?: number
     total_qty: number
     total_revenue: number
-    unit_cost_used?: number
+    unit_cost_used: number | undefined
     gross_profit: number
   }
   stats12?: {
@@ -36,19 +36,22 @@ type ApiResp = {
     sigma_12m: number
     weighted_moq?: number
   }
-  inventory?: { on_hand: number; backorder: number } // <- we will show on-hand in KPI
+  inventory?: { on_hand: number; backorder: number }
 }
 
 export default function ProductDetail() {
   const { id } = useParams()
 
+  // View state
   const [mode, setMode] = useState<'last12' | 'year'>('last12')
   const [year, setYear] = useState<number>(new Date().getFullYear())
 
+  // Data state
   const [data, setData] = useState<ApiResp | null>(null)
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState<string | null>(null)
 
+  // Year options (current year back to 7 years)
   const years = useMemo(() => {
     const y = new Date().getFullYear()
     return Array.from({ length: 8 }, (_, i) => y - i)
@@ -65,15 +68,15 @@ export default function ProductDetail() {
       const params = new URLSearchParams()
       params.set('mode', mode)
       if (mode === 'year') params.set('year', String(year))
-      // “top” still sent for backward compat, but we’ll use allCustomers
+      // keep server default top=5 (not needed now, but harmless)
       params.set('top', '5')
 
       const res = await fetch(
         `${(import.meta as any).env.VITE_API_BASE}/api/products/${id}/overview?` + params.toString(),
         { headers: { Authorization: `Bearer ${token}` } }
       )
-      const json: any = await res.json()
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+      const json: ApiResp | { error?: string } = await res.json()
+      if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`)
       setData(json as ApiResp)
     } catch (e: any) {
       setErr(e.message || 'Failed to load product')
@@ -85,11 +88,11 @@ export default function ProductDetail() {
 
   useEffect(() => { load() }, [id, mode, year])
 
+  // Safe getters
   const asp = data?.pricing?.average_selling_price ?? null
   const unitCost = data?.pricing?.current_unit_cost ?? null
   const weightedMOQ = data?.stats12?.weighted_moq ?? 0
   const sigma12 = data?.stats12?.sigma_12m ?? 0
-  const onHand = data?.inventory?.on_hand ?? 0
 
   const qtyLast12 = useMemo(() => {
     const arr = data?.monthly ?? []
@@ -97,7 +100,14 @@ export default function ProductDetail() {
     return last12.reduce((s, r) => s + Number(r.qty || 0), 0)
   }, [data?.monthly])
 
+  // TRUE gross profit from API (not revenue)
   const grossProfit = data?.profit_window?.gross_profit ?? null
+
+  // Prefer full list of customers; fall back to "topCustomers" if needed
+  const customerRows: CustRow[] = useMemo(() => {
+    if (data?.customers && data.customers.length) return data.customers
+    return data?.topCustomers ?? []
+  }, [data?.customers, data?.topCustomers])
 
   return (
     <AppShell>
@@ -118,6 +128,7 @@ export default function ProductDetail() {
                 <p className="text-gray-600">Product analytics</p>
               </div>
 
+              {/* Toggle controls */}
               <div className="ml-auto flex items-center gap-3">
                 <div className="inline-flex rounded-lg bg-gray-100 p-1">
                   <button
@@ -141,7 +152,9 @@ export default function ProductDetail() {
                     onChange={(e) => setYear(Number(e.target.value))}
                   >
                     {years.map((y) => (
-                      <option key={y} value={y}>{y}</option>
+                      <option key={y} value={y}>
+                        {y}
+                      </option>
                     ))}
                   </select>
                 )}
@@ -191,17 +204,8 @@ export default function ProductDetail() {
               </Card>
             </div>
 
-            {/* KPI row 2 – Weighted MOQ + σ + On hand */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              <Card>
-                <CardContent className="p-6">
-                  <p className="text-sm text-gray-600">Weighted MOQ (4 mo)</p>
-                  <p className="text-2xl font-bold text-gray-900">
-                    {Number(weightedMOQ || 0).toLocaleString()}
-                  </p>
-                </CardContent>
-              </Card>
-
+            {/* KPI row 2 – Weighted MOQ + σ */}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
               <Card>
                 <CardContent className="p-6">
                   <p className="text-sm text-gray-600">σ (12m)</p>
@@ -211,12 +215,11 @@ export default function ProductDetail() {
                 </CardContent>
               </Card>
 
-              {/* NEW: On-hand inventory KPI */}
               <Card>
                 <CardContent className="p-6">
-                  <p className="text-sm text-gray-600">On hand (current)</p>
+                  <p className="text-sm text-gray-600">Weighted MOQ (4 mo)</p>
                   <p className="text-2xl font-bold text-gray-900">
-                    {Number(onHand || 0).toLocaleString()}
+                    {Number(weightedMOQ || 0).toLocaleString()}
                   </p>
                 </CardContent>
               </Card>
@@ -233,24 +236,27 @@ export default function ProductDetail() {
                 <div className="h-80">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart
-                      data={(data.monthly ?? []).map((m) => ({ ...m, label: String(m.month).slice(0, 7) }))}
+                      data={(data.monthly ?? []).map((m) => ({
+                        ...m,
+                        label: String(m.month).slice(0, 7),
+                      }))}
                     >
                       <CartesianGrid strokeDasharray="3 3" />
                       <XAxis dataKey="label" />
                       <YAxis />
                       <Tooltip />
-                      <Line type="monotone" dataKey="qty" dot={false} />
+                      <Line type="monotone" dataKey="qty" dot={false} stroke="#2563eb" />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
               </CardContent>
             </Card>
 
-            {/* NEW: All customers table with “View” (opens in new tab) */}
+            {/* Customers table (now ALL customers in the window) */}
             <Card>
               <CardHeader>
                 <h3 className="text-lg font-semibold text-gray-900">
-                  Customers ({mode === 'year' ? year : 'last 12 months'})
+                  Customers ({customerRows.length})
                 </h3>
               </CardHeader>
               <CardContent>
@@ -260,31 +266,22 @@ export default function ProductDetail() {
                       <TableHead className="w-[60px]">#</TableHead>
                       <TableHead>Customer</TableHead>
                       <TableHead className="text-right">Qty</TableHead>
-                      <TableHead className="text-right w-[120px]">Action</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {(data.allCustomers ?? []).map((c, i) => (
+                    {customerRows.map((c, i) => (
                       <TableRow key={c.customer_id}>
                         <TableCell>{i + 1}</TableCell>
                         <TableCell className="font-medium">{c.customer_name}</TableCell>
-                        <TableCell className="text-right">{Number(c.qty || 0).toLocaleString()}</TableCell>
                         <TableCell className="text-right">
-                          <a
-                            href={`/customers/${c.customer_id}`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="text-primary-700 hover:underline"
-                          >
-                            View
-                          </a>
+                          {Number(c.qty || 0).toLocaleString()}
                         </TableCell>
                       </TableRow>
                     ))}
-                    {(data.allCustomers ?? []).length === 0 && (
+                    {customerRows.length === 0 && (
                       <TableRow>
-                        <TableCell colSpan={4} className="text-center text-gray-500">
-                          No customers in this period.
+                        <TableCell colSpan={3} className="text-center text-gray-500">
+                          No data.
                         </TableCell>
                       </TableRow>
                     )}
