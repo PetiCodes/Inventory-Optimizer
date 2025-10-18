@@ -38,10 +38,6 @@ function stddev(nums: number[]): number {
 const ORDER_COVERAGE_MONTHS = 4
 
 /* ------------------------------ SIMPLE SEARCH ------------------------------ */
-/**
- * GET /api/products/search?q=...&limit=20
- * (Kept for compatibility; not used by the new Products page list.)
- */
 router.get('/products/search', async (req, res) => {
   try {
     const q = String(req.query.q ?? '').trim()
@@ -63,14 +59,6 @@ router.get('/products/search', async (req, res) => {
 })
 
 /* ----------------------- PAGINATED GP-RANKED LIST ----------------------- */
-/**
- * GET /api/products/list
- * Query:
- *   page=1 (1-based)
- *   limit=20
- *   q=search string (matches product name)
- *   order=gp_desc | gp_asc   (default gp_desc)
- */
 router.get('/products/list', async (req, res) => {
   try {
     const page = Math.max(1, Number(req.query.page ?? 1))
@@ -166,14 +154,13 @@ router.get('/products/list', async (req, res) => {
 /* --------------------------- PRODUCT OVERVIEW --------------------------- */
 /**
  * GET /api/products/:id/overview
- *  Query:
- *    mode=last12 | year
- *    year=YYYY   (required if mode=year)
- *    top=1..5
+ * Query:
+ *   mode=last12 | year
+ *   year=YYYY (if mode=year)
  *
- * Cycle 2:
- *  - Accurate gross profit using historical cost-at-sale-date.
- *  - Full customers list for the selected window (aggregated in Node).
+ * GP formula per your request:
+ *   GP = (ASP - Current Unit Cost) * Qty_in_window
+ *   where ASP = (Σ price*qty) / (Σ qty) within the same window
  */
 router.get('/products/:id/overview', async (req, res) => {
   try {
@@ -224,40 +211,26 @@ router.get('/products/:id/overview', async (req, res) => {
       customer_id: String(r.customer_id),
     }))
 
-    // Price points up to end of window
-    const pricesQ = await supabaseService
-      .from('product_prices')
-      .select('effective_date, unit_cost')
-      .eq('product_id', productId)
-      .lte('effective_date', rangeEndISO)
-      .order('effective_date', { ascending: true })
-
-    if (pricesQ.error) return res.status(500).json({ error: pricesQ.error.message })
-    const pricePoints = (pricesQ.data ?? []).map(p => ({
-      eff: String(p.effective_date),
-      cost: Number(p.unit_cost ?? 0),
-    }))
-
-    // Gross profit using historical cost-at-sale-date
-    let pi = -1
-    let currentCost = 0
-    const gpAccumulator = { qty: 0, revenue: 0, cost: 0 }
-
+    // Totals in the window
+    let totalQty = 0
+    let totalRevenue = 0
     for (const s of sales) {
-      while (pi + 1 < pricePoints.length && pricePoints[pi + 1].eff <= s.date) {
-        pi++
-        currentCost = pricePoints[pi].cost
-      }
-      const revenue = s.unit_price * s.qty
-      const cost = currentCost * s.qty
-
-      gpAccumulator.qty += s.qty
-      gpAccumulator.revenue += revenue
-      gpAccumulator.cost += cost
+      totalQty += s.qty
+      totalRevenue += s.qty * s.unit_price
     }
+    const aspWeighted = totalQty > 0 ? totalRevenue / totalQty : 0
 
-    const gross_profit = gpAccumulator.revenue - gpAccumulator.cost
-    const aspWeighted = gpAccumulator.qty > 0 ? gpAccumulator.revenue / gpAccumulator.qty : 0
+    // Current unit cost (0 if missing)
+    const priceNow = await supabaseService
+      .from('v_product_current_price')
+      .select('unit_cost, unit_price, effective_date')
+      .eq('product_id', productId)
+      .maybeSingle()
+    const unit_cost_now = Number(priceNow.data?.unit_cost ?? 0)
+    const unit_price_now = Number(priceNow.data?.unit_price ?? 0)
+
+    // GP by requested formula
+    const gross_profit = (aspWeighted - unit_cost_now) * totalQty
 
     // Monthly series (qty)
     const monthMap = new Map<string, number>()
@@ -301,23 +274,15 @@ router.get('/products/:id/overview', async (req, res) => {
     const sigma12 = stddev(buckets12.map(r => r.qty))
     const weighted_moq = Math.ceil(weightedAvg12 * ORDER_COVERAGE_MONTHS)
 
-    // Inventory & current price
+    // Inventory now (for On hand KPI)
     const inv = await supabaseService
       .from('inventory_current')
       .select('on_hand, backorder')
       .eq('product_id', productId)
       .maybeSingle()
 
-    const priceNow = await supabaseService
-      .from('v_product_current_price')
-      .select('unit_cost, unit_price, effective_date')
-      .eq('product_id', productId)
-      .maybeSingle()
-
     const on_hand = Number(inv.data?.on_hand ?? 0)
     const backorder = Number(inv.data?.backorder ?? 0)
-    const unit_cost_now = Number(priceNow.data?.unit_cost ?? 0)
-    const unit_price_now = Number(priceNow.data?.unit_price ?? 0)
 
     // Seasonality & legacy top customers
     const seas = await supabaseService.rpc('product_seasonality_last12', { p_product_id: productId })
@@ -326,7 +291,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const topRes = await supabaseService.rpc('product_top_customers', { p_product_id: productId, p_limit: top })
     if (topRes.error) return res.status(500).json({ error: topRes.error.message })
 
-    // ---------- All customers in the selected window (aggregate in Node) ----------
+    // All customers in the selected window (aggregate qty in Node)
     const salesCust = await supabaseService
       .from('sales')
       .select('customer_id, quantity')
@@ -370,7 +335,7 @@ router.get('/products/:id/overview', async (req, res) => {
         customer_name: r.customer_name,
         qty: Number(r.qty) || 0,
       })),
-      customers: customersAll, // full list in the selected window
+      customers: customersAll,
       pricing: {
         average_selling_price: aspWeighted,
         current_unit_cost: unit_cost_now,
@@ -379,10 +344,10 @@ router.get('/products/:id/overview', async (req, res) => {
       profit_window: {
         mode,
         year: mode === 'year' ? year : undefined,
-        total_qty: gpAccumulator.qty,
-        total_revenue: gpAccumulator.revenue,
-        unit_cost_used: undefined, // per-sale historical costs
-        gross_profit,              // true GP (not revenue)
+        total_qty: totalQty,
+        total_revenue: totalRevenue,
+        unit_cost_used: unit_cost_now,
+        gross_profit, // (ASP - current cost) * qty
       },
       stats12: {
         weighted_avg_12m: weightedAvg12,
