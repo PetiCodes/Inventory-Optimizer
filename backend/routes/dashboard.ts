@@ -36,9 +36,12 @@ function last12MonthKeys(): string[] {
   }
   return out
 }
-function monthKeyFromISO(iso: string): string {
-  const y = iso.slice(0, 4)
-  const m = iso.slice(5, 7)
+
+/** NEW: robust UTC month key (aligns with Product page) */
+function ymKeyUTCFromDateLike(v: string | Date): string {
+  const d = new Date(typeof v === 'string' ? v + 'T00:00:00Z' : v)
+  const y = d.getUTCFullYear()
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0')
   return `${y}-${m}-01`
 }
 
@@ -56,7 +59,7 @@ type SaleRow = { product_id: string; date: string; quantity: number; unit_price:
 
 const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
-const ORDER_COVERAGE_MONTHS = 4  // ← use 4-month coverage for MOQ
+const ORDER_COVERAGE_MONTHS = 4  // 4-month coverage for MOQ
 
 /** ───────────── Route ───────────── */
 router.get('/dashboard/overview', async (req, res) => {
@@ -103,7 +106,7 @@ router.get('/dashboard/overview', async (req, res) => {
       (s: number, r: any) => s + Number(r.total_qty ?? 0), 0
     )
 
-    // 3) Build monthly buckets for At-Risk
+    // 3) Build monthly buckets for At-Risk (UTC-normalized month keys)
     const sQ = await supabaseService
       .from('sales')
       .select('product_id, date, quantity, unit_price')
@@ -115,13 +118,13 @@ router.get('/dashboard/overview', async (req, res) => {
     }
     const sales = (sQ.data ?? []) as SaleRow[]
 
-    const keys = last12MonthKeys()
+    const keys = last12MonthKeys() // ['YYYY-MM-01', ... oldest -> newest]
     const keyIndex = new Map<string, number>()
     keys.forEach((k, i) => keyIndex.set(k, i))
 
     const perProdMonthly = new Map<string, number[]>() // pid -> [12]
     for (const r of sales) {
-      const mk = monthKeyFromISO(String(r.date))
+      const mk = ymKeyUTCFromDateLike(String(r.date)) // normalize in UTC (fix)
       const idx = keyIndex.get(mk)
       if (idx === undefined) continue
       const pid = String(r.product_id)
@@ -140,7 +143,7 @@ router.get('/dashboard/overview', async (req, res) => {
       (invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)])
     )
 
-    // 5) Compute At-Risk rows (all, sorted by gap DESC)
+    // 5) Compute At-Risk rows (all, sorted by gap DESC) — same math as Product page
     type AtRiskRow = {
       product_id: string
       on_hand: number
@@ -155,9 +158,13 @@ router.get('/dashboard/overview', async (req, res) => {
     for (const pid of pidSet) {
       if (!isUUID(pid)) continue
       const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
-      const weightedSum = arr.reduce((sum, q, i) => sum + q * weights12[i], 0)
+
+      // weights 1..12 (oldest=1, newest=12)
+      let weightedSum = 0
+      for (let i = 0; i < 12; i++) weightedSum += arr[i] * (i + 1)
       const weightedAvg = wSum12 ? (weightedSum / wSum12) : 0
-      const weighted_moq = Math.ceil(weightedAvg * ORDER_COVERAGE_MONTHS) // ← FIX
+      const weighted_moq = Math.ceil(weightedAvg * ORDER_COVERAGE_MONTHS)
+
       const onHand = onHandMap.get(pid) ?? 0
       const gap = Math.max(0, weighted_moq - onHand)
       if (gap > 0) {
