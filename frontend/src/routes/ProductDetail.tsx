@@ -17,7 +17,7 @@ type ApiResp = {
   monthly: MonthlyPoint[]
   seasonality?: { month_num: number; avg_qty: number }[]
   topCustomers?: CustRow[]
-  customers?: CustRow[]            // <-- NEW (all customers)
+  customers?: CustRow[]
   pricing?: {
     average_selling_price: number | null
     current_unit_cost: number | null
@@ -28,7 +28,7 @@ type ApiResp = {
     year?: number
     total_qty: number
     total_revenue: number
-    unit_cost_used: number | undefined
+    unit_cost_used?: number
     gross_profit: number
   }
   stats12?: {
@@ -51,7 +51,7 @@ export default function ProductDetail() {
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState<string | null>(null)
 
-  // Year options (current year back to 7 years)
+  // Year options
   const years = useMemo(() => {
     const y = new Date().getFullYear()
     return Array.from({ length: 8 }, (_, i) => y - i)
@@ -68,7 +68,6 @@ export default function ProductDetail() {
       const params = new URLSearchParams()
       params.set('mode', mode)
       if (mode === 'year') params.set('year', String(year))
-      // keep server default top=5 (not needed now, but harmless)
       params.set('top', '5')
 
       const res = await fetch(
@@ -93,6 +92,7 @@ export default function ProductDetail() {
   const unitCost = data?.pricing?.current_unit_cost ?? null
   const weightedMOQ = data?.stats12?.weighted_moq ?? 0
   const sigma12 = data?.stats12?.sigma_12m ?? 0
+  const onHand = data?.inventory?.on_hand ?? 0
 
   const qtyLast12 = useMemo(() => {
     const arr = data?.monthly ?? []
@@ -100,10 +100,8 @@ export default function ProductDetail() {
     return last12.reduce((s, r) => s + Number(r.qty || 0), 0)
   }, [data?.monthly])
 
-  // TRUE gross profit from API (not revenue)
   const grossProfit = data?.profit_window?.gross_profit ?? null
 
-  // Prefer full list of customers; fall back to "topCustomers" if needed
   const customerRows: CustRow[] = useMemo(() => {
     if (data?.customers && data.customers.length) return data.customers
     return data?.topCustomers ?? []
@@ -166,7 +164,7 @@ export default function ProductDetail() {
             </div>
 
             {/* KPI row 1 */}
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-6">
               <Card>
                 <CardContent className="p-6">
                   <p className="text-sm text-gray-600">Avg Selling Price (ASP)</p>
@@ -202,10 +200,20 @@ export default function ProductDetail() {
                   </p>
                 </CardContent>
               </Card>
+
+              {/* NEW: On hand KPI */}
+              <Card>
+                <CardContent className="p-6">
+                  <p className="text-sm text-gray-600">On hand</p>
+                  <p className="text-2xl font-bold text-gray-900">
+                    {Number(onHand || 0).toLocaleString()}
+                  </p>
+                </CardContent>
+              </Card>
             </div>
 
-            {/* KPI row 2 – Weighted MOQ + σ */}
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            {/* KPI row 2 – σ + Weighted MOQ */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <Card>
                 <CardContent className="p-6">
                   <p className="text-sm text-gray-600">σ (12m)</p>
@@ -245,14 +253,14 @@ export default function ProductDetail() {
                       <XAxis dataKey="label" />
                       <YAxis />
                       <Tooltip />
-                      <Line type="monotone" dataKey="qty" dot={false} stroke="#2563eb" />
+                      <Line type="monotone" dataKey="qty" dot={false} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
               </CardContent>
             </Card>
 
-            {/* Customers table (now ALL customers in the window) */}
+            {/* Customers table (ALL customers in the window) */}
             <Card>
               <CardHeader>
                 <h3 className="text-lg font-semibold text-gray-900">
