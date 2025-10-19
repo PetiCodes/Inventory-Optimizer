@@ -3,12 +3,12 @@ import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
-/* ───────────── Date helpers (identical behavior to products.ts) ───────────── */
+/** ───────────── Date helpers (exactly as in products.ts) ───────────── */
 function monthStartUTC(y: number, m0: number) {
   return new Date(Date.UTC(y, m0, 1))
 }
 function monthEndUTC(y: number, m0: number) {
-  return new Date(Date.UTC(y, m0 + 1, 0)) // last day of month
+  return new Date(Date.UTC(y, m0 + 1, 0)) // last day of this month
 }
 function ymKeyUTC(d: Date): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
@@ -24,7 +24,7 @@ function lastNMonthsScaffold(n: number) {
   return out
 }
 
-/* ───────────── Utils ───────────── */
+/** ───────────── Utils ───────────── */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const isUUID = (v: any): v is string => typeof v === 'string' && UUID_RE.test(v)
 function chunk<T>(arr: T[], size = 200): T[][] {
@@ -33,18 +33,18 @@ function chunk<T>(arr: T[], size = 200): T[][] {
   return out
 }
 
-/* ───────────── Constants (same as product page) ───────────── */
+/** ───────────── Constants (match product page) ───────────── */
 const ORDER_COVERAGE_MONTHS = 4
-const weights12 = Array.from({ length: 12 }, (_, i) => i + 1)
+const weights12 = Array.from({ length: 12 }, (_, i) => i + 1) // oldest=1 … newest=12
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
 
-/* ───────────── Types ───────────── */
-type SaleRow = { product_id: string; date: string; quantity: number }
+/** ───────────── Types ───────────── */
+type SaleRow = { product_id: string; quantity: number }
 
-/* ───────────── Route ───────────── */
+/** ───────────── Route ───────────── */
 router.get('/dashboard/overview', async (req, res) => {
   try {
-    // pagination for At-Risk table in the UI
+    // UI paging for the At-Risk table
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.max(1, Math.min(Number(req.query.pageSize ?? 20), 200))
     const from = (page - 1) * pageSize
@@ -59,7 +59,7 @@ router.get('/dashboard/overview', async (req, res) => {
     if (custHead.error) return res.status(500).json({ error: custHead.error.message })
     const customersCount = custHead.count ?? 0
 
-    // 2) KPI totals (last 12 months window identical to products.ts)
+    // 2) KPI totals — last 12 months window (same as products.ts)
     const s12 = lastNMonthsScaffold(12)
     const startISO = monthStartUTC(s12[0].y, s12[0].m0).toISOString().slice(0, 10)
     const endISO = monthEndUTC(s12[s12.length - 1].y, s12[s12.length - 1].m0).toISOString().slice(0, 10)
@@ -80,41 +80,43 @@ router.get('/dashboard/overview', async (req, res) => {
       (s: number, r: any) => s + Number(r.total_qty ?? 0), 0
     )
 
-    // 3) FETCH *ALL* sales in window (paginate; default limit ~1k misses many rows)
+    // 3) Aggregate ALL sales month-by-month with paging (no hidden row caps)
     const perProdMonthly = new Map<string, number[]>() // pid -> [12]
-    const monthKeys = s12.map(x => `${x.key}-01`)
-    const keyIndex = new Map(monthKeys.map((k, i) => [k, i]))
 
-    const SALES_PAGE = 10000
-    let offset = 0
-    while (true) {
-      const salesBatch = await supabaseService
-        .from('sales')
-        .select('product_id, date, quantity')
-        .gte('date', startISO)
-        .lte('date', endISO)
-        .order('date', { ascending: true })
-        .range(offset, offset + SALES_PAGE - 1)
+    const PAGE = 1000 // PostgREST typical max
+    for (let i = 0; i < 12; i++) {
+      const mStart = monthStartUTC(s12[i].y, s12[i].m0).toISOString().slice(0, 10)
+      const mEnd = monthEndUTC(s12[i].y, s12[i].m0).toISOString().slice(0, 10)
 
-      if (salesBatch.error) {
-        return res.status(500).json({ error: salesBatch.error.message })
+      let offset = 0
+      // paginate within each month
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const batch = await supabaseService
+          .from('sales')
+          .select('product_id,quantity')
+          .gte('date', mStart)
+          .lte('date', mEnd)
+          .range(offset, offset + PAGE - 1)
+
+        if (batch.error) {
+          return res.status(500).json({ error: batch.error.message })
+        }
+
+        const rows = (batch.data ?? []) as SaleRow[]
+        if (rows.length === 0) break
+
+        for (const r of rows) {
+          const pid = String(r.product_id)
+          if (!isUUID(pid)) continue
+          const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
+          arr[i] += Number(r.quantity ?? 0)
+          perProdMonthly.set(pid, arr)
+        }
+
+        if (rows.length < PAGE) break
+        offset += PAGE
       }
-
-      for (const r of (salesBatch.data ?? []) as SaleRow[]) {
-        const d = new Date(String(r.date) + 'T00:00:00Z')
-        const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01`
-        const idx = keyIndex.get(key)
-        if (idx === undefined) continue
-        const pid = String(r.product_id)
-        const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
-        arr[idx] += Number(r.quantity ?? 0)
-        perProdMonthly.set(pid, arr)
-      }
-
-      // stop when we read fewer than the page size
-      const count = salesBatch.data?.length ?? 0
-      if (count < SALES_PAGE) break
-      offset += SALES_PAGE
     }
 
     // 4) Inventory snapshot
@@ -124,7 +126,7 @@ router.get('/dashboard/overview', async (req, res) => {
       (invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)])
     )
 
-    // 5) Compute At-Risk using the SAME MOQ formula as products.ts
+    // 5) Compute At-Risk with EXACT same MOQ formula as products.ts
     type AtRiskRow = { product_id: string; on_hand: number; weighted_moq: number; gap: number }
     const pidSet = new Set<string>([
       ...Array.from(perProdMonthly.keys()),
@@ -183,7 +185,7 @@ router.get('/dashboard/overview', async (req, res) => {
         pages: Math.max(1, Math.ceil(totalAtRisk / pageSize)),
         items: atRiskPage,
       },
-      topProducts: [], // kept for backward-compat
+      topProducts: [], // deprecated / kept for compatibility
     })
   } catch (e: any) {
     console.error('GET /dashboard/overview error:', e)
