@@ -276,6 +276,7 @@ export default function DataUpload() {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* Recalculate button (unchanged) */}
             <Button onClick={refreshGrossProfit} disabled={refreshBusy}>
               {refreshBusy ? (
                 <span className="inline-flex items-center gap-2">
@@ -286,7 +287,12 @@ export default function DataUpload() {
               )}
             </Button>
 
-            <Button variant="danger" onClick={wipeAllData} disabled={wiping}>
+            {/* Delete button: same visual style as recalc, but danger color */}
+            <Button
+              onClick={wipeAllData}
+              disabled={wiping}
+              className="!bg-red-600 !text-white hover:!bg-red-700 focus-visible:!ring-2 focus-visible:!ring-red-500"
+            >
               {wiping ? (
                 <span className="inline-flex items-center gap-2">
                   <Spinner size="sm" /> Deleting…
