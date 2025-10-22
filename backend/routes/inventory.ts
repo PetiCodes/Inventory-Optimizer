@@ -13,23 +13,56 @@ const upload = multer({
 
 const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
 
+/** normalize simple text (lowercase, collapse whitespace) */
 const norm = (v: any) =>
   toStr(v).replace(/^\uFEFF/, '').trim().toLowerCase().replace(/\s+/g, ' ')
 
-// Remove leading "[...]" tags sometimes present in names
+/** Remove leading "[...]" tag */
 const stripLeadingTag = (v: any) =>
   toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
 
+/** Remove leading SKU/code patterns like "ABC-123 - ", "12345: ", "SKU_01 – " */
+const stripLeadingCode = (v: any) =>
+  toStr(v)
+    // common “CODE - ” / “CODE: ” / “CODE – ”
+    .replace(/^\s*([A-Za-z0-9._/#-]+)\s*[-–:]\s+/, '')
+    // plain numeric code followed by space
+    .replace(/^\s*[0-9]{4,}\s+/, '')
+    .trim()
+
+/** Robust number parser: handles US/EU formats, strips all unicode spaces, currency symbols */
 function parseNumber(input: any): number | null {
   if (input === null || input === undefined) return null
   let t = toStr(input).trim()
   if (!t) return null
-  // 1.234,56 style
-  if (/,/.test(t) && !/\.\d+$/.test(t) && /,\d+$/.test(t)) {
+
+  // strip currency symbols and any non-digit/sep characters except dot/comma/minus
+  // also strip all unicode spaces (including NBSP \u00A0 and narrow NBSP \u202F)
+  t = t.replace(/[\u00A0\u202F\s]/g, '') // all spaces
+  t = t.replace(/[^\d.,-]/g, '')        // keep digits, dot, comma, minus
+
+  if (!t) return null
+
+  // If both comma and dot present, decide decimal by the one that appears last
+  const lastComma = t.lastIndexOf(',')
+  const lastDot = t.lastIndexOf('.')
+
+  if (lastComma >= 0 && lastDot >= 0) {
+    if (lastComma > lastDot) {
+      // comma is decimal -> remove dots (thousands), replace comma by dot
+      t = t.replace(/\./g, '').replace(',', '.')
+    } else {
+      // dot is decimal -> remove commas (thousands)
+      t = t.replace(/,/g, '')
+    }
+  } else if (lastComma >= 0) {
+    // only comma present -> treat as decimal (EU)
     t = t.replace(/\./g, '').replace(',', '.')
   } else {
-    t = t.replace(/[, ]/g, '')
+    // only dot or none -> remove any stray commas (US)
+    t = t.replace(/,/g, '')
   }
+
   const n = Number(t)
   return Number.isFinite(n) ? n : null
 }
@@ -59,8 +92,6 @@ const ALIASES: Record<RequiredKey, string[]> = {
   'cost': [],
   'quantity on hand': ['quantity on hand (stocks)']
 }
-
-// Optional headers we’ll look for (do not block import if missing)
 const OPTIONALS = ['reference'] as const
 type OptionalKey = (typeof OPTIONALS)[number]
 
@@ -167,13 +198,16 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     const exactMap = new Map<string,string>()
     const strippedMap = new Map<string,string>()
+    const strippedHardMap = new Map<string,string>() // tag + SKU-code stripped
     for (const p of allProds.data ?? []) {
       const id = toStr(p.id)
       const name = toStr(p.name)
       const ek = norm(name)
       const sk = norm(stripLeadingTag(name))
+      const hk = norm(stripLeadingCode(stripLeadingTag(name)))
       if (ek && !exactMap.has(ek)) exactMap.set(ek, id)
       if (sk && !strippedMap.has(sk)) strippedMap.set(sk, id)
+      if (hk && !strippedHardMap.has(hk)) strippedHardMap.set(hk, id)
     }
 
     // 2) Crosswalk (reference + normalized_name)
@@ -202,13 +236,14 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       const incomingName = toStr(r.name)
       const incomingRef  = r.reference ? toStr(r.reference) : ''
 
-      const nn = norm(stripLeadingTag(incomingName))
+      const nn = norm(stripLeadingCode(stripLeadingTag(incomingName)))
 
       let pid: string | undefined =
         (incomingRef ? refMap.get(incomingRef) : undefined) ??
         xNormMap.get(nn) ??
         exactMap.get(norm(incomingName)) ??
-        strippedMap.get(nn)
+        strippedMap.get(norm(stripLeadingTag(incomingName))) ??
+        strippedHardMap.get(nn)
 
       if (!pid) {
         reject(-1, `No matching product for "${incomingName}"${incomingRef ? ` (ref: ${incomingRef})` : ''}`)
@@ -235,17 +270,12 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    /* ---------------- Upsert crosswalk (by product_id) ----------------
-       - reference_code remains UNIQUE at the DB level
-       - normalized_name is NOT unique anymore; dupes allowed (indexed)
-       - Avoid unique violations by skipping conflicting reference codes
-    --------------------------------------------------------------------*/
+    /* ---------------- Upsert crosswalk (by product_id) ---------------- */
 
-    // collapse by product_id, last-one-wins
+    // collapse by product_id, last-one-wins, but avoid reference conflicts
     const xByPid = new Map<string, { product_id: string; reference_code?: string | null; normalized_name?: string | null }>()
     for (const x of toUpsertXwalk) xByPid.set(x.product_id, x)
 
-    // We already have refMap from DB (ref -> product_id). Use it to avoid conflicts.
     let refConflicts = 0
     const xRows = Array.from(xByPid.values()).map(x => {
       let reference_code = x.reference_code ?? undefined
@@ -253,8 +283,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       if (reference_code) {
         const owner = refMap.get(reference_code)
         if (owner && owner !== x.product_id) {
-          // Someone else already owns this reference code → skip setting it to avoid 23505
-          reference_code = undefined
+          reference_code = undefined // skip conflicting reference binding
           refConflicts++
         }
       }
@@ -298,13 +327,23 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Dedupe
+    // Dedupe prices (by product_id + date); last one wins
     const uniqPrice = Array.from(
-      pricePayload.reduce((m, row) => m.set(`${row.product_id}|${row.effective_date}`, row), new Map<string, PriceRow>()).values()
+      pricePayload.reduce(
+        (m, row) => m.set(`${row.product_id}|${row.effective_date}`, row),
+        new Map<string, PriceRow>()
+      ).values()
     )
-    const uniqInv = Array.from(
-      invPayload.reduce((m, row) => m.set(row.product_id, row), new Map<string, InvRow>()).values()
-    )
+
+    // Dedupe inventory: keep the **largest** on_hand per product in this upload
+    const invMap = new Map<string, InvRow>()
+    for (const row of invPayload) {
+      const prev = invMap.get(row.product_id)
+      if (!prev || row.on_hand > prev.on_hand) {
+        invMap.set(row.product_id, row)
+      }
+    }
+    const uniqInv = Array.from(invMap.values())
 
     // Upserts
     let priceInserted = 0
@@ -320,7 +359,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     for (const part of chunk(uniqInv, 500)) {
       const ins2 = await supabaseService
         .from('inventory_current')
-        .upsert(part, { onConflict: 'product_id' }) // product_id is PK in your schema
+        .upsert(part, { onConflict: 'product_id' })
       if (ins2.error) return res.status(500).json({ error: ins2.error.message })
       invInserted += part.length
     }
@@ -333,7 +372,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
         product_prices: pricePayload.length - uniqPrice.length,
         inventory_current: invPayload.length - uniqInv.length
       },
-      ref_conflicts_skipped: refConflicts,     // number of conflicting Reference codes skipped
+      ref_conflicts_skipped: refConflicts,
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
       sampleRejected: rejected.slice(0, 50)
