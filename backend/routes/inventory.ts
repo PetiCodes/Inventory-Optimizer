@@ -50,20 +50,26 @@ function sheetToAOA(buf: Buffer) {
   return aoa
 }
 
-// Canonical headers and accepted aliases
+/* ---------------- Canonical headers (Reference is OPTIONAL) ---------------- */
 const REQUIRED = ['name', 'sales price', 'cost', 'quantity on hand'] as const
-const ALIASES: Record<(typeof REQUIRED)[number], string[]> = {
+type RequiredKey = (typeof REQUIRED)[number]
+const ALIASES: Record<RequiredKey, string[]> = {
   'name': [],
   'sales price': ['sales price (current)'],
   'cost': [],
   'quantity on hand': ['quantity on hand (stocks)']
 }
 
+// Optional headers we’ll look for (do not block import if missing)
+const OPTIONALS = ['reference'] as const
+type OptionalKey = (typeof OPTIONALS)[number]
+
 type CleanRow = {
   name: string
   unit_price: number
   unit_cost: number
   on_hand: number
+  reference?: string | null
 }
 
 /* --------------------------- route --------------------------- */
@@ -84,15 +90,24 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     // Map headers
     const headerRow = (aoa[0] ?? []).map(h => toStr(h))
-    const idx: Record<(typeof REQUIRED)[number], number> = {
+    const idx: Record<RequiredKey, number> = {
       'name': -1, 'sales price': -1, 'cost': -1, 'quantity on hand': -1
     }
+    const idxOpt: Partial<Record<OptionalKey, number>> = {}
+
     headerRow.map(h => norm(h)).forEach((nh, i) => {
+      // required
       for (const key of REQUIRED) {
         if (idx[key] !== -1) continue
         if (nh === key || ALIASES[key].includes(nh)) idx[key] = i
       }
+      // optionals
+      for (const ok of OPTIONALS) {
+        if (idxOpt[ok] !== undefined) continue
+        if (nh === ok) idxOpt[ok] = i
+      }
     })
+
     const missing = REQUIRED.filter(k => idx[k] === -1)
     if (missing.length) {
       return res.status(400).json({
@@ -119,13 +134,20 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       const price = parseNumber(r[idx['sales price']])
       const cost  = parseNumber(r[idx['cost']])
       const onH   = parseNumber(r[idx['quantity on hand']])
+      const ref   = idxOpt['reference'] !== undefined ? toStr(r[idxOpt['reference']!]).trim() : ''
 
       if (!name) return reject(rowNum, 'Missing Name')
       if (price === null) return reject(rowNum, 'Invalid Sales Price')
       if (cost === null)  return reject(rowNum, 'Invalid Cost')
       if (onH === null)   return reject(rowNum, 'Invalid On Hand')
 
-      clean.push({ name, unit_price: price, unit_cost: cost, on_hand: onH })
+      clean.push({
+        name,
+        unit_price: price,
+        unit_cost: cost,
+        on_hand: onH,
+        reference: ref || null
+      })
     })
 
     if (!clean.length) {
@@ -137,7 +159,9 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Products map (exact + “[tag] name” tolerant)
+    /* ---------------- Build in-memory maps for resolution ---------------- */
+
+    // 1) All products (legacy name matching support)
     const allProds = await supabaseService.from('products').select('id,name')
     if (allProds.error) return res.status(500).json({ error: allProds.error.message })
 
@@ -152,19 +176,54 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       if (sk && !strippedMap.has(sk)) strippedMap.set(sk, id)
     }
 
+    // 2) Crosswalk (reference + normalized_name)
+    const xw = await supabaseService
+      .from('product_lookup')
+      .select('product_id, reference_code, normalized_name')
+    if (xw.error) return res.status(500).json({ error: xw.error.message })
+
+    const refMap = new Map<string, string>()       // reference_code -> product_id
+    const xNormMap = new Map<string, string>()     // normalized_name -> first product_id seen
+    for (const row of xw.data ?? []) {
+      const pid = toStr(row.product_id)
+      const rc  = toStr(row.reference_code || '')
+      const nn  = toStr(row.normalized_name || '')
+      if (rc) refMap.set(rc, pid)
+      if (nn && !xNormMap.has(nn)) xNormMap.set(nn, pid)
+    }
+
+    /* ---------------- Resolve each clean row ---------------- */
+
     type Resolved = CleanRow & { product_id?: string; matched_name?: string }
     const resolved: Resolved[] = []
+    const toUpsertXwalk: { product_id: string; reference_code?: string | null; normalized_name?: string | null }[] = []
+
     for (const r of clean) {
-      const incoming = toStr(r.name)
-      const pid =
-        exactMap.get(norm(incoming)) ??
-        strippedMap.get(norm(stripLeadingTag(incoming)))
+      const incomingName = toStr(r.name)
+      const incomingRef  = r.reference ? toStr(r.reference) : ''
+
+      const nn = norm(stripLeadingTag(incomingName))
+
+      let pid: string | undefined =
+        (incomingRef ? refMap.get(incomingRef) : undefined) ??
+        xNormMap.get(nn) ??
+        exactMap.get(norm(incomingName)) ??
+        strippedMap.get(nn)
+
       if (!pid) {
-        rejected.push({ row: -1, reason: `No matching product for "${incoming}"` })
+        reject(-1, `No matching product for "${incomingName}"${incomingRef ? ` (ref: ${incomingRef})` : ''}`)
         continue
       }
+
       const found = (allProds.data ?? []).find(p => toStr(p.id) === pid)
-      resolved.push({ ...r, product_id: pid, matched_name: toStr(found?.name ?? incoming) })
+      resolved.push({ ...r, product_id: pid, matched_name: toStr(found?.name ?? incomingName) })
+
+      // Prepare crosswalk upsert so the next upload is deterministic & fast
+      toUpsertXwalk.push({
+        product_id: pid,
+        reference_code: incomingRef || null,
+        normalized_name: nn || null
+      })
     }
 
     if (!resolved.length) {
@@ -176,7 +235,47 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Build payloads
+    /* ---------------- Upsert crosswalk (by product_id) ----------------
+       - reference_code remains UNIQUE at the DB level
+       - normalized_name is NOT unique anymore; dupes allowed (indexed)
+       - Avoid unique violations by skipping conflicting reference codes
+    --------------------------------------------------------------------*/
+
+    // collapse by product_id, last-one-wins
+    const xByPid = new Map<string, { product_id: string; reference_code?: string | null; normalized_name?: string | null }>()
+    for (const x of toUpsertXwalk) xByPid.set(x.product_id, x)
+
+    // We already have refMap from DB (ref -> product_id). Use it to avoid conflicts.
+    let refConflicts = 0
+    const xRows = Array.from(xByPid.values()).map(x => {
+      let reference_code = x.reference_code ?? undefined
+      const normalized_name = x.normalized_name ?? undefined
+      if (reference_code) {
+        const owner = refMap.get(reference_code)
+        if (owner && owner !== x.product_id) {
+          // Someone else already owns this reference code → skip setting it to avoid 23505
+          reference_code = undefined
+          refConflicts++
+        }
+      }
+      return {
+        product_id: x.product_id,
+        reference_code,
+        normalized_name
+      }
+    })
+
+    if (xRows.length) {
+      const xUp = await supabaseService
+        .from('product_lookup')
+        .upsert(xRows, { onConflict: 'product_id' })
+      if (xUp.error) {
+        return res.status(500).json({ error: `product_lookup upsert failed: ${xUp.error.message}` })
+      }
+    }
+
+    /* ---------------- Build payloads for inventory & prices ---------------- */
+
     type PriceRow = { product_id: string; effective_date: string; unit_cost: number; unit_price: number }
     type InvRow   = { product_id: string; on_hand: number; backorder?: number }
 
@@ -234,6 +333,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
         product_prices: pricePayload.length - uniqPrice.length,
         inventory_current: invPayload.length - uniqInv.length
       },
+      ref_conflicts_skipped: refConflicts,     // number of conflicting Reference codes skipped
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
       sampleRejected: rejected.slice(0, 50)
