@@ -3,23 +3,20 @@ import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
-/** ───────────── Date helpers (exactly as in products.ts) ───────────── */
+/** ───────────── Date helpers (same as products.ts) ───────────── */
 function monthStartUTC(y: number, m0: number) {
   return new Date(Date.UTC(y, m0, 1))
 }
 function monthEndUTC(y: number, m0: number) {
-  return new Date(Date.UTC(y, m0 + 1, 0)) // last day of this month
-}
-function ymKeyUTC(d: Date): string {
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+  return new Date(Date.UTC(y, m0 + 1, 0))
 }
 function lastNMonthsScaffold(n: number) {
   const now = new Date()
   const anchorStart = monthStartUTC(now.getUTCFullYear(), now.getUTCMonth())
-  const out: { key: string; y: number; m0: number }[] = []
+  const out: { y: number; m0: number }[] = []
   for (let i = n - 1; i >= 0; i--) {
     const d = monthStartUTC(anchorStart.getUTCFullYear(), anchorStart.getUTCMonth() - i)
-    out.push({ key: ymKeyUTC(d), y: d.getUTCFullYear(), m0: d.getUTCMonth() })
+    out.push({ y: d.getUTCFullYear(), m0: d.getUTCMonth() })
   }
   return out
 }
@@ -33,13 +30,13 @@ function chunk<T>(arr: T[], size = 200): T[][] {
   return out
 }
 
-/** ───────────── Constants (match product page) ───────────── */
+/** ───────────── MOQ constants (match products.ts) ───────────── */
 const ORDER_COVERAGE_MONTHS = 4
 const weights12 = Array.from({ length: 12 }, (_, i) => i + 1) // oldest=1 … newest=12
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
 
 /** ───────────── Types ───────────── */
-type SaleRow = { product_id: string; quantity: number }
+type SaleRow = { product_id: string; quantity: number; unit_price?: number | null }
 
 /** ───────────── Route ───────────── */
 router.get('/dashboard/overview', async (req, res) => {
@@ -50,7 +47,7 @@ router.get('/dashboard/overview', async (req, res) => {
     const from = (page - 1) * pageSize
     const to = from + pageSize
 
-    // 1) Totals
+    // 1) Totals (counts)
     const prodHead = await supabaseService.from('products').select('id', { count: 'exact', head: true })
     if (prodHead.error) return res.status(500).json({ error: prodHead.error.message })
     const productsCount = prodHead.count ?? 0
@@ -59,7 +56,7 @@ router.get('/dashboard/overview', async (req, res) => {
     if (custHead.error) return res.status(500).json({ error: custHead.error.message })
     const customersCount = custHead.count ?? 0
 
-    // 2) KPIs — per your spec
+    // 2) KPIs
     // Sales Qty (12m): sum the most recent 12 months from v_sales_monthly_total
     let sales_12m_qty = 0
     {
@@ -68,22 +65,45 @@ router.get('/dashboard/overview', async (req, res) => {
         .select('month,total_qty')
         .order('month', { ascending: false })
         .limit(12)
-
       if (qtyQ.error) return res.status(500).json({ error: qtyQ.error.message })
       sales_12m_qty = (qtyQ.data ?? []).reduce((s: number, r: any) => s + Number(r.total_qty ?? 0), 0)
     }
 
-    
-    
-      const revQ = await supabaseService.from('product_kpis_12m').select('revenue_12m')
-      if (revQ.error) return res.status(500).json({ error: revQ.error.message })
-      const sales_12m_revenue = (revQ.data ?? []).reduce(
-        (s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0
-      )
-    
-
-    // 3) Per-product monthly aggregation for MOQ
+    // Revenue (12m): compute directly from raw sales over the last 12 months (pagination-safe)
     const s12 = lastNMonthsScaffold(12)
+    const startISO = monthStartUTC(s12[0].y, s12[0].m0).toISOString().slice(0, 10)
+    const endISO = monthEndUTC(s12[s12.length - 1].y, s12[s12.length - 1].m0).toISOString().slice(0, 10)
+
+    let sales_12m_revenue = 0
+    {
+      const PAGE = 2000
+      let offset = 0
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const q = await supabaseService
+          .from('sales')
+          .select('quantity,unit_price')
+          .gte('date', startISO)
+          .lte('date', endISO)
+          .range(offset, offset + PAGE - 1)
+
+        if (q.error) return res.status(500).json({ error: q.error.message })
+
+        const rows = (q.data ?? []) as SaleRow[]
+        if (rows.length === 0) break
+
+        for (const r of rows) {
+          const qty = Number(r.quantity ?? 0)
+          const price = Number(r.unit_price ?? 0)
+          sales_12m_revenue += qty * price
+        }
+
+        if (rows.length < PAGE) break
+        offset += PAGE
+      }
+    }
+
+    // 3) Per-product monthly aggregation (for MOQ)
     const perProdMonthly = new Map<string, number[]>() // pid -> [12]
     {
       const PAGE = 1000
@@ -103,7 +123,7 @@ router.get('/dashboard/overview', async (req, res) => {
 
           if (batch.error) return res.status(500).json({ error: batch.error.message })
 
-          const rows = (batch.data ?? []) as SaleRow[]
+          const rows = (batch.data ?? []) as { product_id: string; quantity: number }[]
           if (rows.length === 0) break
 
           for (const r of rows) {
@@ -120,17 +140,39 @@ router.get('/dashboard/overview', async (req, res) => {
       }
     }
 
-    const invQ = await supabaseService.from('inventory_current').select('product_id,on_hand')
-    if (invQ.error) return res.status(500).json({ error: invQ.error.message })
-    const onHandMap = new Map<string, number>(
-      (invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)])
-    )
-    
-    // 5) Compute At-Risk (same MOQ formula as products.ts)
+    // 4) INVENTORY: page through ALL rows to avoid silent 1k cap → fixes "0 on-hand"
+    const onHandMap = new Map<string, number>()
+    {
+      const PAGE = 2000
+      let offset = 0
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const inv = await supabaseService
+          .from('inventory_current')
+          .select('product_id,on_hand')
+          .range(offset, offset + PAGE - 1)
+
+        if (inv.error) return res.status(500).json({ error: inv.error.message })
+
+        const rows = inv.data ?? []
+        if (rows.length === 0) break
+
+        for (const r of rows as any[]) {
+          const pid = String(r.product_id)
+          if (!isUUID(pid)) continue
+          onHandMap.set(pid, Number(r.on_hand ?? 0))
+        }
+
+        if (rows.length < PAGE) break
+        offset += PAGE
+      }
+    }
+
+    // 5) Compute At-Risk (same MOQ formula as product page)
     type AtRiskRow = { product_id: string; on_hand: number; weighted_moq: number; gap: number }
     const pidSet = new Set<string>([
       ...Array.from(perProdMonthly.keys()),
-      ...Array.from(onHandMap.keys()),
+      ...Array.from(onHandMap.keys()), // include items with inventory but no recent sales
     ])
 
     const atRiskAll: AtRiskRow[] = []
@@ -185,7 +227,7 @@ router.get('/dashboard/overview', async (req, res) => {
         pages: Math.max(1, Math.ceil(totalAtRisk / pageSize)),
         items: atRiskPage,
       },
-      topProducts: [], // deprecated / kept for compatibility
+      topProducts: [],
     })
   } catch (e: any) {
     console.error('GET /dashboard/overview error:', e)
