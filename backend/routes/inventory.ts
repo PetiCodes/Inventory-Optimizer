@@ -4,8 +4,6 @@ import xlsx from 'xlsx'
 import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
-
-// Keep your existing 30MB limit (raise if your sheets are bigger)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 }
@@ -15,15 +13,14 @@ const upload = multer({
 
 const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
 
-// normalized_name we store in DB
-const normalize = (v: any) =>
+const norm = (v: any) =>
   toStr(v).replace(/^\uFEFF/, '').trim().toLowerCase().replace(/\s+/g, ' ')
 
 function parseNumber(input: any): number | null {
   if (input === null || input === undefined) return null
   let t = toStr(input).trim()
   if (!t) return null
-  // 1.234,56 style
+  // “1.234,56”
   if (/,/.test(t) && !/\.\d+$/.test(t) && /,\d+$/.test(t)) {
     t = t.replace(/\./g, '').replace(',', '.')
   } else {
@@ -49,7 +46,7 @@ function sheetToAOA(buf: Buffer) {
   return aoa
 }
 
-// Canonical headers and accepted aliases (as you had)
+// Canonical headers and accepted aliases
 const REQUIRED = ['name', 'sales price', 'cost', 'quantity on hand'] as const
 const ALIASES: Record<(typeof REQUIRED)[number], string[]> = {
   'name': [],
@@ -86,7 +83,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const idx: Record<(typeof REQUIRED)[number], number> = {
       'name': -1, 'sales price': -1, 'cost': -1, 'quantity on hand': -1
     }
-    headerRow.map(h => normalize(h)).forEach((nh, i) => {
+    headerRow.map(h => norm(h)).forEach((nh, i) => {
       for (const key of REQUIRED) {
         if (idx[key] !== -1) continue
         if (nh === key || ALIASES[key].includes(nh)) idx[key] = i
@@ -100,10 +97,11 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Rows -> clean
+    // Rows (skip fully empty)
     const rows = aoa.slice(1).filter(r => r && r.some((c: any) => toStr(c).trim() !== ''))
     if (!rows.length) return res.status(400).json({ error: 'No data rows found' })
 
+    // Clean & validate
     const clean: CleanRow[] = []
     const rejected: { row: number; reason: string }[] = []
     const reasonCounts = new Map<string, number>()
@@ -119,7 +117,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       const cost  = parseNumber(r[idx['cost']])
       const onH   = parseNumber(r[idx['quantity on hand']])
 
-      if (!name) return reject(rowNum, 'Missing Name')
+      if (!name)      return reject(rowNum, 'Missing Name')
       if (price === null) return reject(rowNum, 'Invalid Sales Price')
       if (cost === null)  return reject(rowNum, 'Invalid Cost')
       if (onH === null)   return reject(rowNum, 'Invalid On Hand')
@@ -136,102 +134,106 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    /* ----------------------------------------------------------------
-       1) Ensure products exist (CREATE if missing) using the exact name
-          you give us (includes the [####] ref), PLUS populate normalized_name.
-       ---------------------------------------------------------------- */
-    const uniqueNames = Array.from(new Set(clean.map(r => r.name)))
-    const productUpserts = uniqueNames.map(name => ({
+    /* ------------------------------------------------------------
+       1) Ensure products exist (by exact Name).
+          We also set normalized_name = normalized(Name).
+       ------------------------------------------------------------ */
+    const uniqueProducts = Array.from(new Set(clean.map(r => r.name)))
+    const productUpserts = uniqueProducts.map(name => ({
       name,
-      normalized_name: normalize(name)
+      normalized_name: name.trim().toLowerCase().replace(/\s+/g, ' ')
     }))
 
-    // Upsert by name (unique constraint on products.name)
-    const up = await supabaseService
+    const upProducts: any = await supabaseService
       .from('products')
-      .upsert(productUpserts, { onConflict: 'name' })
-    if (up.error) {
-      return res.status(500).json({ error: up.error.message })
+      .upsert(productUpserts, { onConflict: 'name', ignoreDuplicates: false })
+    if (upProducts.error) {
+      return res.status(500).json({ error: upProducts.error.message })
     }
 
-    // Fetch back ids by exact names (should all exist now)
+    // Fetch ids for all product names we touched
     const idMap = new Map<string, string>()
-    for (const part of chunk(uniqueNames, 500)) {
-      const r = await supabaseService
+    for (const group of chunk(uniqueProducts, 500)) {
+      const sel: any = await supabaseService
         .from('products')
         .select('id,name')
-        .in('name', part)
-      if (r.error) return res.status(500).json({ error: r.error.message })
-      for (const p of r.data ?? []) idMap.set(toStr(p.name), toStr(p.id))
+        .in('name', group)
+      if (sel.error) return res.status(500).json({ error: sel.error.message })
+      for (const p of sel.data ?? []) idMap.set(String(p.name), String(p.id))
     }
 
-    // Any still missing → report (should be zero unless name too long/null)
-    const missingNames = uniqueNames.filter(n => !idMap.has(n))
-    if (missingNames.length) {
-      return res.status(500).json({
-        error: 'Failed to resolve product ids for some names',
-        details: missingNames.slice(0, 20)
-      })
-    }
-
-    /* ----------------------------------------------------------------
-       2) Build payloads for price + inventory and upsert
-       ---------------------------------------------------------------- */
+    // Resolve rows → product_id (keep the last occurrence per product for On Hand)
     type PriceRow = { product_id: string; effective_date: string; unit_cost: number; unit_price: number }
-    type InvRow   = { product_id: string; on_hand: number; backorder?: number }
+    type InvRow   = { product_id: string; on_hand: number; backorder?: number; updated_at?: string }
 
     const todayISO = new Date().toISOString().slice(0, 10)
-    const pricePayload: PriceRow[] = []
-    const invPayload:   InvRow[]   = []
+    const nowTS = new Date().toISOString()
+
+    const pricePayload = new Map<string, PriceRow>() // key: pid|date
+    const invPayload   = new Map<string, InvRow>()   // key: pid
 
     for (const r of clean) {
-      const pid = idMap.get(r.name)!
-      pricePayload.push({
-        product_id: pid,
-        effective_date: todayISO,
-        unit_cost: Number(r.unit_cost) || 0,
-        unit_price: Number(r.unit_price) || 0
-      })
-      invPayload.push({
-        product_id: pid,
-        on_hand: Number(r.on_hand) || 0,
-        backorder: 0
+      const pid = idMap.get(r.name)
+      if (!pid) continue
+
+      pricePayload.set(
+        `${pid}|${todayISO}`,
+        {
+          product_id: pid,
+          effective_date: todayISO,
+          unit_cost: Number(r.unit_cost) || 0,
+          unit_price: Number(r.unit_price) || 0
+        }
+      )
+
+      invPayload.set(
+        pid,
+        {
+          product_id: pid,
+          on_hand: Number(r.on_hand) || 0,
+          backorder: 0,
+          updated_at: nowTS
+        }
+      )
+    }
+
+    const uniqPrice = Array.from(pricePayload.values())
+    const uniqInv = Array.from(invPayload.values())
+
+    if (!uniqInv.length) {
+      return res.status(400).json({
+        error: 'No rows matched products after upsert (unexpected)',
+        rejectedCount: rejected.length,
+        reasonCounts: Object.fromEntries(reasonCounts),
+        sampleRejected: rejected.slice(0, 50)
       })
     }
 
-    // Collapse duplicates within the same upload (keep last)
-    const uniqPrice = Array.from(
-      pricePayload.reduce((m, row) => m.set(`${row.product_id}|${row.effective_date}`, row), new Map<string, PriceRow>()).values()
-    )
-    const uniqInv = Array.from(
-      invPayload.reduce((m, row) => m.set(row.product_id, row), new Map<string, InvRow>()).values()
-    )
-
-    // Upsert prices
-    let priceRows = 0
+    /* ------------------------------------------------------------
+       2) Upsert product_prices (today) and inventory_current
+       ------------------------------------------------------------ */
+    let priceInserted = 0
     for (const part of chunk(uniqPrice, 500)) {
-      const ins = await supabaseService
+      const ins: any = await supabaseService
         .from('product_prices')
         .upsert(part, { onConflict: 'product_id,effective_date' })
       if (ins.error) return res.status(500).json({ error: ins.error.message })
-      priceRows += part.length
+      priceInserted += part.length
     }
 
-    // Upsert inventory
-    let invRows = 0
+    let invInserted = 0
     for (const part of chunk(uniqInv, 500)) {
-      const ins2 = await supabaseService
+      const ins2: any = await supabaseService
         .from('inventory_current')
         .upsert(part, { onConflict: 'product_id' })
       if (ins2.error) return res.status(500).json({ error: ins2.error.message })
-      invRows += part.length
+      invInserted += part.length
     }
 
     return res.json({
-      products_seen: uniqueNames.length,
-      products_upserted_or_matched: uniqueNames.length,
-      price_rows: priceRows,
-      inventory_rows: invRows,
+      imported_products: uniqueProducts.length,
+      price_rows: priceInserted,
+      inventory_rows: invInserted,
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
       sampleRejected: rejected.slice(0, 50)
