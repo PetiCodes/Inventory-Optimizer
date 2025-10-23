@@ -39,7 +39,7 @@ const weights12 = Array.from({ length: 12 }, (_, i) => i + 1) // oldest=1 … ne
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
 
 /** ───────────── Types ───────────── */
-type SaleRow = { product_id: string; quantity: number; unit_price: number | null }
+type SaleRow = { product_id: string; quantity: number; unit_price?: number | null }
 
 /** ───────────── Route ───────────── */
 router.get('/dashboard/overview', async (req, res) => {
@@ -59,7 +59,7 @@ router.get('/dashboard/overview', async (req, res) => {
     if (custHead.error) return res.status(500).json({ error: custHead.error.message })
     const customersCount = custHead.count ?? 0
 
-    // 2) KPI totals — compute directly from sales in the last 12 full months
+    // 2) KPIs from raw sales over the last 12 months
     const s12 = lastNMonthsScaffold(12)
     const startISO = monthStartUTC(s12[0].y, s12[0].m0).toISOString().slice(0, 10)
     const endISO = monthEndUTC(s12[s12.length - 1].y, s12[s12.length - 1].m0).toISOString().slice(0, 10)
@@ -95,7 +95,7 @@ router.get('/dashboard/overview', async (req, res) => {
       }
     }
 
-    // 3) Aggregate ALL sales per product month-by-month (for MOQ calc)
+    // 3) Per-product monthly aggregation for MOQ
     const perProdMonthly = new Map<string, number[]>() // pid -> [12]
     {
       const PAGE = 1000
@@ -113,9 +113,7 @@ router.get('/dashboard/overview', async (req, res) => {
             .lte('date', mEnd)
             .range(offset, offset + PAGE - 1)
 
-          if (batch.error) {
-            return res.status(500).json({ error: batch.error.message })
-          }
+          if (batch.error) return res.status(500).json({ error: batch.error.message })
 
           const rows = (batch.data ?? []) as { product_id: string; quantity: number }[]
           if (rows.length === 0) break
@@ -134,18 +132,39 @@ router.get('/dashboard/overview', async (req, res) => {
       }
     }
 
-    // 4) Inventory snapshot (ensures on-hand is included for items with no sales)
-    const invQ = await supabaseService.from('inventory_current').select('product_id,on_hand')
-    if (invQ.error) return res.status(500).json({ error: invQ.error.message })
-    const onHandMap = new Map<string, number>(
-      (invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)])
-    )
+    // 4) INVENTORY: page through ALL rows (fixes missing on-hand on dashboard)
+    const onHandMap = new Map<string, number>()
+    {
+      const PAGE = 2000
+      let offset = 0
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const inv = await supabaseService
+          .from('inventory_current')
+          .select('product_id,on_hand')
+          .range(offset, offset + PAGE - 1)
 
-    // 5) Compute At-Risk with EXACT same MOQ formula as products.ts
+        if (inv.error) return res.status(500).json({ error: inv.error.message })
+
+        const rows = inv.data ?? []
+        if (rows.length === 0) break
+
+        for (const r of rows as any[]) {
+          const pid = String(r.product_id)
+          if (!isUUID(pid)) continue
+          onHandMap.set(pid, Number(r.on_hand ?? 0))
+        }
+
+        if (rows.length < PAGE) break
+        offset += PAGE
+      }
+    }
+
+    // 5) Compute At-Risk (same MOQ formula as products.ts)
     type AtRiskRow = { product_id: string; on_hand: number; weighted_moq: number; gap: number }
     const pidSet = new Set<string>([
       ...Array.from(perProdMonthly.keys()),
-      ...Array.from(onHandMap.keys()),
+      ...Array.from(onHandMap.keys()), // include items with inventory but no recent sales
     ])
 
     const atRiskAll: AtRiskRow[] = []
@@ -157,9 +176,7 @@ router.get('/dashboard/overview', async (req, res) => {
       const weighted_moq = Math.ceil(weightedAvg12 * ORDER_COVERAGE_MONTHS)
       const on_hand = onHandMap.get(pid) ?? 0
       const gap = Math.max(0, weighted_moq - on_hand)
-      if (gap > 0) {
-        atRiskAll.push({ product_id: pid, on_hand, weighted_moq, gap })
-      }
+      if (gap > 0) atRiskAll.push({ product_id: pid, on_hand, weighted_moq, gap })
     }
 
     atRiskAll.sort((a, b) => b.gap - a.gap)
