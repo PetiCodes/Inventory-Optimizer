@@ -39,7 +39,7 @@ const weights12 = Array.from({ length: 12 }, (_, i) => i + 1) // oldest=1 … ne
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
 
 /** ───────────── Types ───────────── */
-type SaleRow = { product_id: string; quantity: number; unit_price?: number | null }
+type SaleRow = { product_id: string; quantity: number }
 
 /** ───────────── Route ───────────── */
 router.get('/dashboard/overview', async (req, res) => {
@@ -59,43 +59,30 @@ router.get('/dashboard/overview', async (req, res) => {
     if (custHead.error) return res.status(500).json({ error: custHead.error.message })
     const customersCount = custHead.count ?? 0
 
-    // 2) KPIs from raw sales over the last 12 months
-    const s12 = lastNMonthsScaffold(12)
-    const startISO = monthStartUTC(s12[0].y, s12[0].m0).toISOString().slice(0, 10)
-    const endISO = monthEndUTC(s12[s12.length - 1].y, s12[s12.length - 1].m0).toISOString().slice(0, 10)
-
+    // 2) KPIs — per your spec
+    // Sales Qty (12m): sum the most recent 12 months from v_sales_monthly_total
     let sales_12m_qty = 0
-    let sales_12m_revenue = 0
     {
-      const PAGE = 2000
-      let offset = 0
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        const q = await supabaseService
-          .from('sales')
-          .select('quantity,unit_price')
-          .gte('date', startISO)
-          .lte('date', endISO)
-          .range(offset, offset + PAGE - 1)
+      const qtyQ = await supabaseService
+        .from('v_sales_monthly_total')
+        .select('month,total_qty')
+        .order('month', { ascending: false })
+        .limit(12)
 
-        if (q.error) return res.status(500).json({ error: q.error.message })
-
-        const rows = (q.data ?? []) as SaleRow[]
-        if (rows.length === 0) break
-
-        for (const r of rows) {
-          const qty = Number(r.quantity ?? 0)
-          const price = Number(r.unit_price ?? 0)
-          sales_12m_qty += qty
-          sales_12m_revenue += qty * price
-        }
-
-        if (rows.length < PAGE) break
-        offset += PAGE
-      }
+      if (qtyQ.error) return res.status(500).json({ error: qtyQ.error.message })
+      sales_12m_qty = (qtyQ.data ?? []).reduce((s: number, r: any) => s + Number(r.total_qty ?? 0), 0)
     }
 
-    // 3) Per-product monthly aggregation for MOQ
+    // Revenue (12m): sum revenue_12m from product_kpis_12m
+    let sales_12m_revenue = 0
+    {
+      const revQ = await supabaseService.from('product_kpis_12m').select('revenue_12m')
+      if (revQ.error) return res.status(500).json({ error: revQ.error.message })
+      sales_12m_revenue = (revQ.data ?? []).reduce((s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0)
+    }
+
+    // 3) Per-product monthly aggregation for MOQ (unchanged)
+    const s12 = lastNMonthsScaffold(12)
     const perProdMonthly = new Map<string, number[]>() // pid -> [12]
     {
       const PAGE = 1000
@@ -164,7 +151,7 @@ router.get('/dashboard/overview', async (req, res) => {
     type AtRiskRow = { product_id: string; on_hand: number; weighted_moq: number; gap: number }
     const pidSet = new Set<string>([
       ...Array.from(perProdMonthly.keys()),
-      ...Array.from(onHandMap.keys()), // include items with inventory but no recent sales
+      ...Array.from(onHandMap.keys()),
     ])
 
     const atRiskAll: AtRiskRow[] = []
@@ -190,7 +177,9 @@ router.get('/dashboard/overview', async (req, res) => {
       for (const part of chunk(atRiskIds, 200)) {
         const nQ = await supabaseService.from('products').select('id,name').in('id', part)
         if (nQ.error) return res.status(500).json({ error: nQ.error.message })
-        for (const p of nQ.data ?? []) nameMap.set(String(p.id), String(p.name ?? ''))
+        for (const p of (nQ.data ?? []) as any[]) {
+          nameMap.set(String(p.id), String(p.name ?? ''))
+        }
       }
     }
 
