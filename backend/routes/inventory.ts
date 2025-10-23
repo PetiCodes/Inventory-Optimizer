@@ -4,6 +4,8 @@ import xlsx from 'xlsx'
 import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
+
+// Keep your existing 30MB limit (raise if your sheets are bigger)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 }
@@ -13,13 +15,9 @@ const upload = multer({
 
 const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
 
-/** normalize: trim, lowercase, collapse spaces */
-const norm = (v: any) =>
+// normalized_name we store in DB
+const normalize = (v: any) =>
   toStr(v).replace(/^\uFEFF/, '').trim().toLowerCase().replace(/\s+/g, ' ')
-
-/** remove a single leading "[...]" tag if present */
-const stripLeadingTag = (v: any) =>
-  toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
 
 function parseNumber(input: any): number | null {
   if (input === null || input === undefined) return null
@@ -51,13 +49,13 @@ function sheetToAOA(buf: Buffer) {
   return aoa
 }
 
-// Canonical headers and accepted aliases
+// Canonical headers and accepted aliases (as you had)
 const REQUIRED = ['name', 'sales price', 'cost', 'quantity on hand'] as const
 const ALIASES: Record<(typeof REQUIRED)[number], string[]> = {
-  name: [],
+  'name': [],
   'sales price': ['sales price (current)'],
-  cost: [],
-  'quantity on hand': ['quantity on hand (stocks)'],
+  'cost': [],
+  'quantity on hand': ['quantity on hand (stocks)']
 }
 
 type CleanRow = {
@@ -80,64 +78,51 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     try {
       aoa = sheetToAOA(req.file.buffer)
     } catch {
-      return res.status(400).json({
-        error: 'Unable to parse file. Use .xlsx/.xls/.csv with headers.',
-      })
+      return res.status(400).json({ error: 'Unable to parse file. Use .xlsx/.xls/.csv with headers.' })
     }
 
     // Map headers
-    const headerRow = (aoa[0] ?? []).map((h) => toStr(h))
+    const headerRow = (aoa[0] ?? []).map(h => toStr(h))
     const idx: Record<(typeof REQUIRED)[number], number> = {
-      name: -1,
-      'sales price': -1,
-      cost: -1,
-      'quantity on hand': -1,
+      'name': -1, 'sales price': -1, 'cost': -1, 'quantity on hand': -1
     }
-    headerRow
-      .map((h) => norm(h))
-      .forEach((nh, i) => {
-        for (const key of REQUIRED) {
-          if (idx[key] !== -1) continue
-          if (nh === key || ALIASES[key].includes(nh)) idx[key] = i
-        }
-      })
-    const missing = REQUIRED.filter((k) => idx[k] === -1)
+    headerRow.map(h => normalize(h)).forEach((nh, i) => {
+      for (const key of REQUIRED) {
+        if (idx[key] !== -1) continue
+        if (nh === key || ALIASES[key].includes(nh)) idx[key] = i
+      }
+    })
+    const missing = REQUIRED.filter(k => idx[k] === -1)
     if (missing.length) {
       return res.status(400).json({
-        error:
-          'Invalid headers. Expected: Name, Sales Price, Cost, Quantity On Hand',
-        details: { received: headerRow, missing },
+        error: 'Invalid headers. Expected: Name, Sales Price, Cost, Quantity On Hand',
+        details: { received: headerRow, missing }
       })
     }
 
     // Rows -> clean
-    const rows = aoa
-      .slice(1)
-      .filter((r) => r && r.some((c: any) => toStr(c).trim() !== ''))
-    if (!rows.length)
-      return res.status(400).json({ error: 'No data rows found' })
+    const rows = aoa.slice(1).filter(r => r && r.some((c: any) => toStr(c).trim() !== ''))
+    if (!rows.length) return res.status(400).json({ error: 'No data rows found' })
 
     const clean: CleanRow[] = []
     const rejected: { row: number; reason: string }[] = []
     const reasonCounts = new Map<string, number>()
-    const bump = (reason: string) =>
-      reasonCounts.set(reason, (reasonCounts.get(reason) || 0) + 1)
     const reject = (row: number, reason: string) => {
       rejected.push({ row, reason })
-      bump(reason)
+      reasonCounts.set(reason, (reasonCounts.get(reason) || 0) + 1)
     }
 
     rows.forEach((r, i) => {
       const rowNum = i + 2
-      const name = toStr(r[idx['name']]).trim()
+      const name  = toStr(r[idx['name']]).trim()
       const price = parseNumber(r[idx['sales price']])
-      const cost = parseNumber(r[idx['cost']])
-      const onH = parseNumber(r[idx['quantity on hand']])
+      const cost  = parseNumber(r[idx['cost']])
+      const onH   = parseNumber(r[idx['quantity on hand']])
 
       if (!name) return reject(rowNum, 'Missing Name')
       if (price === null) return reject(rowNum, 'Invalid Sales Price')
-      if (cost === null) return reject(rowNum, 'Invalid Cost')
-      if (onH === null) return reject(rowNum, 'Invalid On Hand')
+      if (cost === null)  return reject(rowNum, 'Invalid Cost')
+      if (onH === null)   return reject(rowNum, 'Invalid On Hand')
 
       clean.push({ name, unit_price: price, unit_cost: cost, on_hand: onH })
     })
@@ -147,175 +132,109 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
         error: 'No valid rows to import',
         rejectedCount: rejected.length,
         reasonCounts: Object.fromEntries(reasonCounts),
-        sampleRejected: rejected.slice(0, 50),
+        sampleRejected: rejected.slice(0, 50)
       })
     }
 
-    /* ---------------------------------------------------------------
-     * 1) Ensure products exist (upsert by name) and set normalized_name
-     *    normalized_name := norm(stripLeadingTag(name))
-     * --------------------------------------------------------------- */
-    const uniqNames = Array.from(new Set(clean.map((r) => r.name)))
-    const upsertProducts = uniqNames.map((name) => ({
+    /* ----------------------------------------------------------------
+       1) Ensure products exist (CREATE if missing) using the exact name
+          you give us (includes the [####] ref), PLUS populate normalized_name.
+       ---------------------------------------------------------------- */
+    const uniqueNames = Array.from(new Set(clean.map(r => r.name)))
+    const productUpserts = uniqueNames.map(name => ({
       name,
-      normalized_name: norm(stripLeadingTag(name)),
+      normalized_name: normalize(name)
     }))
 
-    // Upsert by 'name' (unique)
-    const upProducts = await supabaseService
+    // Upsert by name (unique constraint on products.name)
+    const up = await supabaseService
       .from('products')
-      .upsert(upsertProducts, { onConflict: 'name', ignoreDuplicates: true })
-    if (upProducts.error)
-      return res.status(500).json({ error: upProducts.error.message })
+      .upsert(productUpserts, { onConflict: 'name' })
+    if (up.error) {
+      return res.status(500).json({ error: up.error.message })
+    }
 
-    // Fetch ids for the names we just upserted.
-    // We match by exact name OR by normalized_name (derived from the file),
-    // so a future file that drops the [####] still finds the same product.
-    const uniqNorms = Array.from(
-      new Set(uniqNames.map((n) => norm(stripLeadingTag(n))))
-    )
-
-    const inPartsNames = chunk(uniqNames, 500)
-    const inPartsNorms = chunk(uniqNorms, 500)
-
-    const found: Array<{ id: string; name: string; normalized_name: string | null }> = []
-
-    for (const part of inPartsNames) {
+    // Fetch back ids by exact names (should all exist now)
+    const idMap = new Map<string, string>()
+    for (const part of chunk(uniqueNames, 500)) {
       const r = await supabaseService
         .from('products')
-        .select('id,name,normalized_name')
+        .select('id,name')
         .in('name', part)
       if (r.error) return res.status(500).json({ error: r.error.message })
-      found.push(...(r.data ?? []))
-    }
-    // Add any that matched only via normalized_name
-    for (const part of inPartsNorms) {
-      const r = await supabaseService
-        .from('products')
-        .select('id,name,normalized_name')
-        .in('normalized_name', part)
-      if (r.error) return res.status(500).json({ error: r.error.message })
-      // Avoid duplicates by id
-      const have = new Set(found.map((x) => x.id))
-      for (const row of r.data ?? []) if (!have.has(row.id)) found.push(row)
+      for (const p of r.data ?? []) idMap.set(toStr(p.name), toStr(p.id))
     }
 
-    const byExact = new Map(found.map((p) => [p.name, p.id]))
-    const byNorm = new Map(
-      found.map((p) => [norm(p.normalized_name ?? ''), p.id])
-    )
+    // Any still missing → report (should be zero unless name too long/null)
+    const missingNames = uniqueNames.filter(n => !idMap.has(n))
+    if (missingNames.length) {
+      return res.status(500).json({
+        error: 'Failed to resolve product ids for some names',
+        details: missingNames.slice(0, 20)
+      })
+    }
 
-    /* ---------------------------------------------------------------
-     * 2) Build price + inventory payloads mapped to product_id
-     * --------------------------------------------------------------- */
+    /* ----------------------------------------------------------------
+       2) Build payloads for price + inventory and upsert
+       ---------------------------------------------------------------- */
+    type PriceRow = { product_id: string; effective_date: string; unit_cost: number; unit_price: number }
+    type InvRow   = { product_id: string; on_hand: number; backorder?: number }
+
     const todayISO = new Date().toISOString().slice(0, 10)
-
-    type PriceRow = {
-      product_id: string
-      effective_date: string
-      unit_cost: number
-      unit_price: number
-    }
-    type InvRow = { product_id: string; on_hand: number; backorder?: number }
-
     const pricePayload: PriceRow[] = []
-    const invPayload: InvRow[] = []
-
-    let matchedExact = 0
-    let matchedNormalized = 0
-    let unmatched = 0
+    const invPayload:   InvRow[]   = []
 
     for (const r of clean) {
-      const pidExact = byExact.get(r.name)
-      const pidNorm = byNorm.get(norm(stripLeadingTag(r.name)))
-      const pid = pidExact ?? pidNorm
-      if (!pid) {
-        unmatched++
-        continue
-      }
-      if (pidExact) matchedExact++
-      else matchedNormalized++
-
+      const pid = idMap.get(r.name)!
       pricePayload.push({
         product_id: pid,
         effective_date: todayISO,
         unit_cost: Number(r.unit_cost) || 0,
-        unit_price: Number(r.unit_price) || 0,
+        unit_price: Number(r.unit_price) || 0
       })
       invPayload.push({
         product_id: pid,
         on_hand: Number(r.on_hand) || 0,
-        backorder: 0,
+        backorder: 0
       })
     }
 
-    if (!pricePayload.length || !invPayload.length) {
-      return res.status(400).json({
-        error: 'No rows matched existing products',
-        details: {
-          attempted: clean.length,
-          unmatched,
-          matchedExact,
-          matchedNormalized,
-        },
-        rejectedCount: rejected.length,
-        reasonCounts: Object.fromEntries(reasonCounts),
-        sampleRejected: rejected.slice(0, 50),
-      })
-    }
-
-    // Collapse duplicates (keep the last occurrence in file)
+    // Collapse duplicates within the same upload (keep last)
     const uniqPrice = Array.from(
-      pricePayload
-        .reduce(
-          (m, row) =>
-            m.set(`${row.product_id}|${row.effective_date}`, row),
-          new Map<string, PriceRow>()
-        )
-        .values()
+      pricePayload.reduce((m, row) => m.set(`${row.product_id}|${row.effective_date}`, row), new Map<string, PriceRow>()).values()
     )
     const uniqInv = Array.from(
-      invPayload
-        .reduce(
-          (m, row) => m.set(row.product_id, row),
-          new Map<string, InvRow>()
-        )
-        .values()
+      invPayload.reduce((m, row) => m.set(row.product_id, row), new Map<string, InvRow>()).values()
     )
 
-    /* ---------------------------------------------------------------
-     * 3) Upserts (batched)
-     * --------------------------------------------------------------- */
-    let priceInserted = 0
+    // Upsert prices
+    let priceRows = 0
     for (const part of chunk(uniqPrice, 500)) {
       const ins = await supabaseService
         .from('product_prices')
         .upsert(part, { onConflict: 'product_id,effective_date' })
       if (ins.error) return res.status(500).json({ error: ins.error.message })
-      priceInserted += part.length
+      priceRows += part.length
     }
 
-    let invInserted = 0
+    // Upsert inventory
+    let invRows = 0
     for (const part of chunk(uniqInv, 500)) {
       const ins2 = await supabaseService
         .from('inventory_current')
-        .upsert(part, { onConflict: 'product_id' }) // PK/unique
+        .upsert(part, { onConflict: 'product_id' })
       if (ins2.error) return res.status(500).json({ error: ins2.error.message })
-      invInserted += part.length
+      invRows += part.length
     }
 
     return res.json({
-      matched_products: pricePayload.length, // same as invPayload length
-      match_breakdown: { exact: matchedExact, normalized: matchedNormalized, unmatched },
-      price_rows: priceInserted,
-      inventory_rows: invInserted,
-      collapsed_duplicates: {
-        product_prices: pricePayload.length - uniqPrice.length,
-        inventory_current: invPayload.length - uniqInv.length,
-      },
+      products_seen: uniqueNames.length,
+      products_upserted_or_matched: uniqueNames.length,
+      price_rows: priceRows,
+      inventory_rows: invRows,
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
-      sampleRejected: rejected.slice(0, 50),
+      sampleRejected: rejected.slice(0, 50)
     })
   } catch (e: any) {
     console.error('UNHANDLED /api/inventory/upload error:', e)
