@@ -1,12 +1,10 @@
-// backend/routes/upload.ts
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
-import { supabaseService } from '../src/supabase.js' // NodeNext: keep .js suffix
+import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
-// 30 MB is safe for large spreadsheets
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 }
@@ -22,21 +20,16 @@ function chunk<T>(arr: T[], size = 250): T[][] {
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
   return out
 }
-
-function toStr(v: any): string {
-  return v === null || v === undefined ? '' : String(v)
-}
+const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
 
 function parseQuantity(v: any): number | null {
   if (v === null || v === undefined) return null
   let s = String(v).trim()
   if (!s) return null
-  // support “1.234,56” and “1,234.56”
   if (/,/.test(s) && !/\.\d+$/.test(s) && /,\d+$/.test(s)) {
-    s = s.replace(/\./g, '')   // thousands
-    s = s.replace(',', '.')    // decimal
+    s = s.replace(/\./g, '').replace(',', '.')
   } else {
-    s = s.replace(/[, ]/g, '') // thousands
+    s = s.replace(/[, ]/g, '')
   }
   const n = Number(s)
   return Number.isFinite(n) ? n : null
@@ -58,7 +51,6 @@ function isExcelSerial(v: any): boolean {
   const n = Number(v)
   return Number.isFinite(n) && n > 0 && n < 100000
 }
-
 function excelSerialToISO(serial: number): string | null {
   const d = xlsx.SSF.parse_date_code(serial)
   if (!d) return null
@@ -67,11 +59,10 @@ function excelSerialToISO(serial: number): string | null {
   const dd = String(d.d).padStart(2, '0')
   return `${yyyy}-${mm}-${dd}`
 }
-
 function tryParseDateString(s: string): string | null {
   const t = s.trim()
   if (!t) return null
-  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t // YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t
   const d = new Date(t)
   if (!isNaN(d.getTime())) {
     const yyyy = d.getFullYear()
@@ -81,7 +72,6 @@ function tryParseDateString(s: string): string | null {
   }
   return null
 }
-
 function sheetToAOA(buf: Buffer): any[][] {
   const wb = xlsx.read(buf, { type: 'buffer' })
   const sheetName = wb.SheetNames[0]
@@ -91,7 +81,6 @@ function sheetToAOA(buf: Buffer): any[][] {
   if (!aoa?.length) throw new Error('No data in sheet')
   return aoa
 }
-
 async function selectByNames(
   table: 'customers' | 'products',
   names: string[]
@@ -101,7 +90,7 @@ async function selectByNames(
   const parts = chunk(uniq, 100)
   const out: { id: string; name: string }[] = []
   for (const p of parts) {
-    const r: any = await supabaseService.from(table).select('id,name').in('name', p)
+    const r = await supabaseService.from(table).select('id,name').in('name', p)
     if (r.error) throw r.error
     out.push(...(r.data ?? []))
   }
@@ -200,28 +189,22 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    /* ------------------------------------------------------------
-       Upsert master data (customers/products) by exact name.
-       Also populate products.normalized_name safely.
-       ------------------------------------------------------------ */
+    // Upsert master data (customers/products) in small chunks
     const uniqueCustomers = Array.from(new Set(clean.map(r => r.Customer)))
     const uniqueProducts  = Array.from(new Set(clean.map(r => r.Product)))
 
-    const up1: any = await supabaseService
-      .from('customers')
-      .upsert(uniqueCustomers.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
-    if (up1.error) return res.status(500).json({ error: up1.error.message })
-
-    const up2: any = await supabaseService
-      .from('products')
-      .upsert(
-        uniqueProducts.map(name => ({
-          name,
-          normalized_name: name.trim().toLowerCase().replace(/\s+/g, ' ')
-        })),
-        { onConflict: 'name', ignoreDuplicates: false }
-      )
-    if (up2.error) return res.status(500).json({ error: up2.error.message })
+    for (const part of chunk(uniqueCustomers, 200)) {
+      const up1 = await supabaseService
+        .from('customers')
+        .upsert(part.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
+      if (up1.error) return res.status(500).json({ error: up1.error.message })
+    }
+    for (const part of chunk(uniqueProducts, 200)) {
+      const up2 = await supabaseService
+        .from('products')
+        .upsert(part.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
+      if (up2.error) return res.status(500).json({ error: up2.error.message })
+    }
 
     // Map names → ids
     const custRows = await selectByNames('customers', uniqueCustomers)
@@ -229,7 +212,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const custMap = new Map(custRows.map(c => [c.name, c.id]))
     const prodMap = new Map(prodRows.map(p => [p.name, p.id]))
 
-    // Build sales payload (no dedupe, simple insert)
+    // Build sales payload
     const salesPayload = clean
       .map(r => ({
         date: r.Date,
@@ -251,11 +234,11 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Insert in batches (no upsert)
+    // Insert in batches
     const batches = chunk(salesPayload, 250)
     let inserted = 0
     for (const b of batches) {
-      const ins: any = await supabaseService.from('sales').insert(b, { count: 'exact' })
+      const ins = await supabaseService.from('sales').insert(b, { count: 'exact' })
       if (ins.error) {
         return res.status(500).json({ error: ins.error.message, inserted })
       }
