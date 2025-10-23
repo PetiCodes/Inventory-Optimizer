@@ -206,7 +206,7 @@ router.get('/dashboard/overview', async (req, res) => {
     const atRiskPage = pageSlice.map(r => ({
       product_id: r.product_id,
       product_name: (nameMap.get(r.product_id) || '').trim() || '(unknown product)',
-      const onHand = onHandMap.get(pid) ?? r.on_hand ?? 0
+      on_hand: r.on_hand,
       weighted_moq: r.weighted_moq,
       gap: r.gap,
       // If you want to show backorders later, you already have them in backorderMap
