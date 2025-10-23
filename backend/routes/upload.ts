@@ -2,11 +2,9 @@
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
-import { supabaseService } from '../src/supabase.js' // NodeNext: keep .js suffix
+import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
-
-// 30 MB is safe for large spreadsheets
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 }
@@ -23,20 +21,23 @@ function chunk<T>(arr: T[], size = 250): T[][] {
   return out
 }
 
-function toStr(v: any): string {
-  return v === null || v === undefined ? '' : String(v)
-}
+const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
+
+const norm = (v: any) =>
+  toStr(v).replace(/^\uFEFF/, '').trim().toLowerCase().replace(/\s+/g, ' ')
+
+// legacy helper if some sales rows arrive without bracket tags
+const stripLeadingTag = (v: any) =>
+  toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
 
 function parseQuantity(v: any): number | null {
   if (v === null || v === undefined) return null
   let s = String(v).trim()
   if (!s) return null
-  // support “1.234,56” and “1,234.56”
   if (/,/.test(s) && !/\.\d+$/.test(s) && /,\d+$/.test(s)) {
-    s = s.replace(/\./g, '')   // thousands
-    s = s.replace(',', '.')    // decimal
+    s = s.replace(/\./g, '').replace(',', '.')
   } else {
-    s = s.replace(/[, ]/g, '') // thousands
+    s = s.replace(/[, ]/g, '')
   }
   const n = Number(s)
   return Number.isFinite(n) ? n : null
@@ -71,7 +72,7 @@ function excelSerialToISO(serial: number): string | null {
 function tryParseDateString(s: string): string | null {
   const t = s.trim()
   if (!t) return null
-  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t // YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t
   const d = new Date(t)
   if (!isNaN(d.getTime())) {
     const yyyy = d.getFullYear()
@@ -94,14 +95,18 @@ function sheetToAOA(buf: Buffer): any[][] {
 
 async function selectByNames(
   table: 'customers' | 'products',
-  names: string[]
-): Promise<{ id: string; name: string }[]> {
+  names: string[],
+  column: 'name' | 'normalized_name' = 'name'
+): Promise<{ id: string; name: string; normalized_name?: string }[]> {
   if (!names.length) return []
   const uniq = Array.from(new Set(names.filter(Boolean)))
-  const parts = chunk(uniq, 100)
-  const out: { id: string; name: string }[] = []
+  const parts = chunk(uniq, 300)
+  const out: { id: string; name: string; normalized_name?: string }[] = []
   for (const p of parts) {
-    const r = await supabaseService.from(table).select('id,name').in('name', p)
+    const r = await supabaseService
+      .from(table)
+      .select(column === 'name' ? 'id,name' : 'id,name,normalized_name')
+      .in(column, p)
     if (r.error) throw r.error
     out.push(...(r.data ?? []))
   }
@@ -200,38 +205,94 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Upsert master data (customers/products)
-    const uniqueCustomers = Array.from(new Set(clean.map(r => r.Customer)))
-    const uniqueProducts  = Array.from(new Set(clean.map(r => r.Product)))
+    /* ---------- master data handling ---------- */
 
+    // Customers: keep your original behavior (safe)
+    const uniqueCustomers = Array.from(new Set(clean.map(r => r.Customer)))
     const up1 = await supabaseService
       .from('customers')
       .upsert(uniqueCustomers.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
     if (up1.error) return res.status(500).json({ error: up1.error.message })
-
-    const up2 = await supabaseService
-      .from('products')
-      .upsert(uniqueProducts.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
-    if (up2.error) return res.status(500).json({ error: up2.error.message })
-
-    // Map names → ids
     const custRows = await selectByNames('customers', uniqueCustomers)
-    const prodRows = await selectByNames('products', uniqueProducts)
     const custMap = new Map(custRows.map(c => [c.name, c.id]))
-    const prodMap = new Map(prodRows.map(p => [p.name, p.id]))
 
-    // Build sales payload (no dedupe, simple insert)
-    const salesPayload = clean
-      .map(r => ({
+    // Products: DO NOT CREATE here (inventory should have created them already)
+    const uniqueProducts = Array.from(new Set(clean.map(r => r.Product)))
+    const normalizedProducts = uniqueProducts.map(p => norm(p))
+    const strippedProducts = uniqueProducts.map(p => stripLeadingTag(p))
+
+    // Fetch by exact name
+    const prodExact = await selectByNames('products', uniqueProducts, 'name')
+    // Fetch by normalized_name as fallback
+    const prodNormRows = await selectByNames('products', Array.from(new Set(normalizedProducts)), 'normalized_name')
+
+    // Build lookup maps
+    const byExact = new Map<string, string>() // name -> id
+    for (const r of prodExact) byExact.set(r.name, r.id)
+
+    // For normalized_name we must ensure uniqueness to avoid ambiguous matches
+    const normToIds = new Map<string, Set<string>>()
+    for (const r of prodNormRows) {
+      const key = norm(r.normalized_name ?? r.name)
+      if (!normToIds.has(key)) normToIds.set(key, new Set())
+      normToIds.get(key)!.add(r.id)
+    }
+
+    // Optional legacy fallback using stripped name to normalized_name
+    const strippedNormToId = new Map<string, string>()
+    for (const p of uniqueProducts) {
+      const sn = norm(stripLeadingTag(p))
+      strippedNormToId.set(sn, '') // placeholder; will fill if unique later
+    }
+
+    // resolve function
+    function resolveProductId(name: string): string | undefined {
+      // 1) exact name
+      const exact = byExact.get(name)
+      if (exact) return exact
+      // 2) normalized_name unique hit
+      const nn = norm(name)
+      const set = normToIds.get(nn)
+      if (set && set.size === 1) return Array.from(set)[0]
+      // 3) legacy stripped tag (only if unique by normalized)
+      const sn = norm(stripLeadingTag(name))
+      const set2 = normToIds.get(sn)
+      if (set2 && set2.size === 1) return Array.from(set2)[0]
+      return undefined
+    }
+
+    // Build sales payload (only mapped rows)
+    const salesPayload: Array<{
+      date: string
+      quantity: number
+      unit_price: number | null
+      customer_id: string
+      product_id: string
+    }> = []
+
+    for (let i = 0; i < clean.length; i++) {
+      const r = clean[i]
+      const rowNum = i + 2
+      const cid = custMap.get(r.Customer)
+      const pid = resolveProductId(r.Product)
+
+      if (!cid) {
+        reject(rowNum, `Unknown Customer "${r.Customer}"`)
+        continue
+      }
+      if (!pid) {
+        reject(rowNum, `Unknown Product "${r.Product}" (not found; inventory should create products)`)
+        continue
+      }
+
+      salesPayload.push({
         date: r.Date,
         quantity: r.Quantity,
-        unit_price: r.Price, // may be null
-        customer_id: custMap.get(r.Customer) as string | undefined,
-        product_id: prodMap.get(r.Product) as string | undefined
-      }))
-      .filter(x => x.customer_id && x.product_id) as Array<{
-        date: string; quantity: number; unit_price: number | null; customer_id: string; product_id: string;
-      }>
+        unit_price: r.Price,
+        customer_id: cid,
+        product_id: pid
+      })
+    }
 
     if (!salesPayload.length) {
       return res.status(400).json({
