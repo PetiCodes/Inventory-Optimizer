@@ -12,19 +12,17 @@ const upload = multer({
 /* -------------------------- helpers -------------------------- */
 
 const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
-
 const stripBOM = (s: string) => s.replace(/^\uFEFF/, '')
 const collapseSpaces = (s: string) => s.replace(/\s+/g, ' ')
 
-/** Normalize any leading brackets to simple [..], keep if present, then trim */
+/** Normalize leading brackets to ASCII [..], keep them, then trim + collapse spaces */
 function canonName(raw: any): string {
   const t = stripBOM(toStr(raw)).trim()
-  // normalize odd bracket glyphs to ASCII [ ]
   const normBrackets = t.replace(/^\s*[［\[]([^］\]]+)[］\]]\s*/, '[$1] ')
   return collapseSpaces(normBrackets)
 }
 
-/** Legacy safety (does not run on DB values—only as a fallback key) */
+/** Legacy safety (fallback key only) */
 const stripLeadingTag = (v: any) =>
   toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
 
@@ -69,10 +67,43 @@ const ALIASES: Record<(typeof REQUIRED)[number], string[]> = {
 
 type CleanRow = { name: string; unit_price: number; unit_cost: number; on_hand: number }
 
+/* ------------------ PostgREST-safe pagination helpers ------------------ */
+
+async function fetchAllProducts(): Promise<Array<{ id: string; name: string }>> {
+  const pageSize = 1000 // PostgREST default cap
+  let from = 0
+  let all: Array<{ id: string; name: string }> = []
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const to = from + pageSize - 1
+    const r = await supabaseService
+      .from('products')
+      .select('id,name')
+      .range(from, to)
+
+    if (r.error) throw r.error
+    const batch = (r.data ?? []).map((p: any) => ({ id: String(p.id), name: String(p.name) }))
+    all = all.concat(batch)
+    if (batch.length < pageSize) break
+    from += pageSize
+    // small yield to avoid “fetch failed” bursts
+    await sleep(3)
+  }
+  return all
+}
+
 /* --------------------------- route --------------------------- */
 
 router.post('/inventory/upload', upload.single('file'), async (req, res) => {
-  const stage = { parse: false, upsertProducts: 0, builtAgg: 0, mapProducts: 0, priceBatches: 0, invBatches: 0 }
+  const stage = {
+    parse: false,
+    upsertProducts: 0,
+    builtAgg: 0,
+    fetchedProducts: 0,
+    priceBatches: 0,
+    invBatches: 0
+  }
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'File is required (field name "file")' })
@@ -143,7 +174,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // ---- FIX #1: Aggregate duplicates by Name (sum on_hand; keep last non-null price/cost) ----
+    // Aggregate duplicates by Name (sum on_hand, keep last non-null price/cost)
     type AggRow = { name: string; unit_price: number; unit_cost: number; on_hand: number }
     const agg = new Map<string, AggRow>()
     for (const r of rawClean) {
@@ -152,7 +183,6 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       if (!prev) {
         agg.set(key, { ...r })
       } else {
-        // Sum quantities, keep the latest price/cost (file order is kept)
         agg.set(key, {
           name: key,
           on_hand: (Number(prev.on_hand) || 0) + (Number(r.on_hand) || 0),
@@ -164,7 +194,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const clean = Array.from(agg.values())
     stage.builtAgg = clean.length
 
-    // 1) Ensure products exist (create new if missing) — use aggregated names
+    // Ensure products exist
     const uniqueNames = clean.map(r => r.name)
     for (const part of chunk(uniqueNames, 75)) {
       const up = await supabaseService
@@ -175,23 +205,23 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       await sleep(5)
     }
 
-    // 2) Robust mapping: fetch ALL products once, build multiple keys → id
-    const allP = await supabaseService.from('products').select('id,name')
-    if (allP.error) return res.status(500).json({ error: allP.error.message, stage, step: 'fetch_all_products' })
+    // **FIX: fetch ALL products with pagination (no 1000-row cap)**
+    const allProducts = await fetchAllProducts()
+    stage.fetchedProducts = allProducts.length
 
+    // Build mapping keys
     const exactMap = new Map<string, string>()
     const strippedMap = new Map<string, string>()
-    for (const p of allP.data ?? []) {
-      const id = String((p as any).id)
-      const nm = String((p as any).name)
+    for (const p of allProducts) {
+      const id = p.id
+      const nm = p.name
       const cExact = canonName(nm)
       const cStrip = canonName(stripLeadingTag(nm))
       if (cExact && !exactMap.has(cExact)) exactMap.set(cExact, id)
       if (cStrip && !strippedMap.has(cStrip)) strippedMap.set(cStrip, id)
     }
-    stage.mapProducts = exactMap.size
 
-    // 3) Build payloads with *aggregated* on_hand
+    // Build payloads
     type PriceRow = { product_id: string; effective_date: string; unit_cost: number; unit_price: number }
     type InvRow   = { product_id: string; on_hand: number; backorder?: number }
 
@@ -214,37 +244,24 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       const unit_price = Number.isFinite(Number(r.unit_price)) ? Number(r.unit_price) : 0
       const on_hand    = Number.isFinite(Number(r.on_hand))    ? Number(r.on_hand)    : 0
 
-      pricePayload.push({
-        product_id: pid,
-        effective_date: todayISO,
-        unit_cost,
-        unit_price
-      })
-      invPayload.push({
-        product_id: pid,
-        on_hand,
-        backorder: 0
-      })
+      pricePayload.push({ product_id: pid, effective_date: todayISO, unit_cost, unit_price })
+      invPayload.push({ product_id: pid, on_hand, backorder: 0 })
     }
 
-    // Collapse duplicates by (product_id|effective_date) and product_id
+    // Dedupe final payloads
     const uniqPrice = Array.from(
       pricePayload.reduce((m, row) => m.set(`${row.product_id}|${row.effective_date}`, row), new Map<string, PriceRow>()).values()
     )
     const uniqInv = Array.from(
       invPayload.reduce((m, row) => {
         const existing = m.get(row.product_id)
-        if (!existing) {
-          m.set(row.product_id, row)
-        } else {
-          // If somehow duplicates slipped in after mapping, **sum** on_hand as well
-          m.set(row.product_id, { ...row, on_hand: (existing.on_hand || 0) + (row.on_hand || 0) })
-        }
+        if (!existing) m.set(row.product_id, row)
+        else m.set(row.product_id, { ...row, on_hand: (existing.on_hand || 0) + (row.on_hand || 0) })
         return m
       }, new Map<string, InvRow>()).values()
     )
 
-    // 4) Upserts (small batches + sleep)
+    // Upserts
     let priceInserted = 0
     for (const part of chunk(uniqPrice, 75)) {
       const ins = await supabaseService
@@ -281,7 +298,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       await sleep(6)
     }
 
-    // 5) VERIFY & RETRY missing inventory rows for *this* upload
+    // Verify & retry
     const uploadedPids = Array.from(new Set(uniqInv.map(r => r.product_id)))
     const existingInv = new Set<string>()
     for (const part of chunk(uploadedPids, 200)) {
