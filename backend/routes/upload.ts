@@ -1,3 +1,4 @@
+// backend/routes/upload.ts
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
@@ -200,8 +201,8 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     }
 
     /* ------------------------------------------------------------
-       Upsert master data (customers/products)
-       - We also populate products.normalized_name (safe).
+       Upsert master data (customers/products) by exact name.
+       Also populate products.normalized_name safely.
        ------------------------------------------------------------ */
     const uniqueCustomers = Array.from(new Set(clean.map(r => r.Customer)))
     const uniqueProducts  = Array.from(new Set(clean.map(r => r.Product)))
@@ -218,7 +219,6 @@ router.post('/upload', upload.single('file'), async (req, res) => {
           name,
           normalized_name: name.trim().toLowerCase().replace(/\s+/g, ' ')
         })),
-        // allow updating normalized_name when name already exists
         { onConflict: 'name', ignoreDuplicates: false }
       )
     if (up2.error) return res.status(500).json({ error: up2.error.message })
