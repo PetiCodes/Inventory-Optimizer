@@ -26,7 +26,6 @@ const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
 const norm = (v: any) =>
   toStr(v).replace(/^\uFEFF/, '').trim().toLowerCase().replace(/\s+/g, ' ')
 
-// legacy helper if some sales rows arrive without bracket tags
 const stripLeadingTag = (v: any) =>
   toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
 
@@ -93,6 +92,11 @@ function sheetToAOA(buf: Buffer): any[][] {
   return aoa
 }
 
+/**
+ * Fetch rows by a list of names against either "name" or "normalized_name".
+ * NOTE: we cast the select string and result to `any` to avoid Supabase's
+ * type parser producing a ParserError type at compile time.
+ */
 async function selectByNames(
   table: 'customers' | 'products',
   names: string[],
@@ -103,12 +107,14 @@ async function selectByNames(
   const parts = chunk(uniq, 300)
   const out: { id: string; name: string; normalized_name?: string }[] = []
   for (const p of parts) {
-    const r = await supabaseService
+    const selectCols =
+      column === 'name' ? ('id,name' as any) : ('id,name,normalized_name' as any)
+    const r: any = await supabaseService
       .from(table)
-      .select(column === 'name' ? 'id,name' : 'id,name,normalized_name')
-      .in(column, p)
+      .select(selectCols)
+      .in(column as any, p)
     if (r.error) throw r.error
-    out.push(...(r.data ?? []))
+    out.push(...((r.data ?? []) as any[]))
   }
   return out
 }
@@ -132,7 +138,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const idx: Record<string, number> = {}
     headerRow.forEach((h, i) => { idx[toKey(h)] = i })
 
-    const missing = REQUIRED.filter(k => idx[k] === undefined)
+    const missing = (['date','customer name','product','quantity'] as const).filter(k => idx[k] === undefined)
     if (missing.length) {
       return res.status(400).json({
         error: 'Invalid headers. Expected: Date, Customer Name, Product, Quantity (Price optional)',
@@ -207,30 +213,26 @@ router.post('/upload', upload.single('file'), async (req, res) => {
 
     /* ---------- master data handling ---------- */
 
-    // Customers: keep your original behavior (safe)
+    // Customers: upsert (safe)
     const uniqueCustomers = Array.from(new Set(clean.map(r => r.Customer)))
     const up1 = await supabaseService
       .from('customers')
       .upsert(uniqueCustomers.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
     if (up1.error) return res.status(500).json({ error: up1.error.message })
-    const custRows = await selectByNames('customers', uniqueCustomers)
+    const custRows = await selectByNames('customers', uniqueCustomers, 'name')
     const custMap = new Map(custRows.map(c => [c.name, c.id]))
 
-    // Products: DO NOT CREATE here (inventory should have created them already)
+    // Products: DO NOT CREATE here — inventory should have created them
     const uniqueProducts = Array.from(new Set(clean.map(r => r.Product)))
     const normalizedProducts = uniqueProducts.map(p => norm(p))
-    const strippedProducts = uniqueProducts.map(p => stripLeadingTag(p))
 
-    // Fetch by exact name
     const prodExact = await selectByNames('products', uniqueProducts, 'name')
-    // Fetch by normalized_name as fallback
     const prodNormRows = await selectByNames('products', Array.from(new Set(normalizedProducts)), 'normalized_name')
 
-    // Build lookup maps
     const byExact = new Map<string, string>() // name -> id
     for (const r of prodExact) byExact.set(r.name, r.id)
 
-    // For normalized_name we must ensure uniqueness to avoid ambiguous matches
+    // normalized_name must be unique per key to use
     const normToIds = new Map<string, Set<string>>()
     for (const r of prodNormRows) {
       const key = norm(r.normalized_name ?? r.name)
@@ -238,23 +240,12 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       normToIds.get(key)!.add(r.id)
     }
 
-    // Optional legacy fallback using stripped name to normalized_name
-    const strippedNormToId = new Map<string, string>()
-    for (const p of uniqueProducts) {
-      const sn = norm(stripLeadingTag(p))
-      strippedNormToId.set(sn, '') // placeholder; will fill if unique later
-    }
-
-    // resolve function
     function resolveProductId(name: string): string | undefined {
-      // 1) exact name
       const exact = byExact.get(name)
       if (exact) return exact
-      // 2) normalized_name unique hit
       const nn = norm(name)
       const set = normToIds.get(nn)
       if (set && set.size === 1) return Array.from(set)[0]
-      // 3) legacy stripped tag (only if unique by normalized)
       const sn = norm(stripLeadingTag(name))
       const set2 = normToIds.get(sn)
       if (set2 && set2.size === 1) return Array.from(set2)[0]
@@ -281,7 +272,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
         continue
       }
       if (!pid) {
-        reject(rowNum, `Unknown Product "${r.Product}" (not found; inventory should create products)`)
+        reject(rowNum, `Unknown Product "${r.Product}" (not found; import via inventory first)`)
         continue
       }
 
