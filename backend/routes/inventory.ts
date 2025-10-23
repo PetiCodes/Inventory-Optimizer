@@ -13,18 +13,15 @@ const upload = multer({
 
 const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
 
+// normalization: trim, lower, collapse spaces; keeps bracket content intact
 const norm = (v: any) =>
   toStr(v).replace(/^\uFEFF/, '').trim().toLowerCase().replace(/\s+/g, ' ')
-
-// Remove leading "[...]" tags sometimes present in names
-const stripLeadingTag = (v: any) =>
-  toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
 
 function parseNumber(input: any): number | null {
   if (input === null || input === undefined) return null
   let t = toStr(input).trim()
   if (!t) return null
-  // 1.234,56 style
+  // Support 1.234,56 style
   if (/,/.test(t) && !/\.\d+$/.test(t) && /,\d+$/.test(t)) {
     t = t.replace(/\./g, '').replace(',', '.')
   } else {
@@ -137,29 +134,26 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Products map (exact + “[tag] name” tolerant)
+    // Products map — STRICT exact normalized name match (expects "[####] Name" in Name)
     const allProds = await supabaseService.from('products').select('id,name')
     if (allProds.error) return res.status(500).json({ error: allProds.error.message })
 
-    const exactMap = new Map<string,string>()
-    const strippedMap = new Map<string,string>()
+    const byNormName = new Map<string, string>() // norm(name) -> product_id
     for (const p of allProds.data ?? []) {
       const id = toStr(p.id)
-      const name = toStr(p.name)
-      const ek = norm(name)
-      const sk = norm(stripLeadingTag(name))
-      if (ek && !exactMap.has(ek)) exactMap.set(ek, id)
-      if (sk && !strippedMap.has(sk)) strippedMap.set(sk, id)
+      const key = norm(p.name)
+      if (key && !byNormName.has(key)) byNormName.set(key, id)
     }
 
     type Resolved = CleanRow & { product_id?: string; matched_name?: string }
     const resolved: Resolved[] = []
+    const unmatchedSamples: string[] = []
+
     for (const r of clean) {
       const incoming = toStr(r.name)
-      const pid =
-        exactMap.get(norm(incoming)) ??
-        strippedMap.get(norm(stripLeadingTag(incoming)))
+      const pid = byNormName.get(norm(incoming))
       if (!pid) {
+        if (unmatchedSamples.length < 25) unmatchedSamples.push(incoming)
         rejected.push({ row: -1, reason: `No matching product for "${incoming}"` })
         continue
       }
@@ -169,7 +163,9 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     if (!resolved.length) {
       return res.status(400).json({
-        error: 'No rows matched existing products',
+        error: 'No rows matched existing products (strict name match)',
+        hint: 'Ensure Name column contains the exact product name including the leading reference in [brackets].',
+        samples_unmatched: unmatchedSamples,
         rejectedCount: rejected.length,
         reasonCounts: Object.fromEntries(reasonCounts),
         sampleRejected: rejected.slice(0, 50)
@@ -199,7 +195,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Dedupe
+    // Dedupe within the upload
     const uniqPrice = Array.from(
       pricePayload.reduce((m, row) => m.set(`${row.product_id}|${row.effective_date}`, row), new Map<string, PriceRow>()).values()
     )
@@ -236,7 +232,8 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       },
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
-      sampleRejected: rejected.slice(0, 50)
+      sampleRejected: rejected.slice(0, 50),
+      unmatched_samples: unmatchedSamples
     })
   } catch (e: any) {
     console.error('UNHANDLED /api/inventory/upload error:', e)
