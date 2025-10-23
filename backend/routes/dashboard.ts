@@ -73,7 +73,7 @@ router.get('/dashboard/overview', async (req, res) => {
       sales_12m_qty = (qtyQ.data ?? []).reduce((s: number, r: any) => s + Number(r.total_qty ?? 0), 0)
     }
 
-    // Revenue (12m): sum revenue_12m from product_kpis_12m
+    // Revenue (12m): sum revenue_12m from product_kpis_12m (same as your old code)
     let sales_12m_revenue = 0
     {
       const revQ = await supabaseService.from('product_kpis_12m').select('revenue_12m')
@@ -81,7 +81,7 @@ router.get('/dashboard/overview', async (req, res) => {
       sales_12m_revenue = (revQ.data ?? []).reduce((s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0)
     }
 
-    // 3) Per-product monthly aggregation for MOQ (unchanged)
+    // 3) Per-product monthly aggregation for MOQ
     const s12 = lastNMonthsScaffold(12)
     const perProdMonthly = new Map<string, number[]>() // pid -> [12]
     {
@@ -102,7 +102,7 @@ router.get('/dashboard/overview', async (req, res) => {
 
           if (batch.error) return res.status(500).json({ error: batch.error.message })
 
-          const rows = (batch.data ?? []) as { product_id: string; quantity: number }[]
+          const rows = (batch.data ?? []) as SaleRow[]
           if (rows.length === 0) break
 
           for (const r of rows) {
@@ -119,7 +119,7 @@ router.get('/dashboard/overview', async (req, res) => {
       }
     }
 
-    // 4) INVENTORY: page through ALL rows (fixes missing on-hand on dashboard)
+    // 4) INVENTORY: page through ALL rows (prevents missed on-hand values)
     const onHandMap = new Map<string, number>()
     {
       const PAGE = 2000
