@@ -13,15 +13,24 @@ const upload = multer({
 
 const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
 
-// normalization: trim, lower, collapse spaces; keeps bracket content intact
 const norm = (v: any) =>
   toStr(v).replace(/^\uFEFF/, '').trim().toLowerCase().replace(/\s+/g, ' ')
+
+// Remove leading "[...]" tag in names
+const stripLeadingTag = (v: any) =>
+  toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
+
+// Extract the content inside the very first leading [ ... ] if present
+const extractRef = (v: any): string | null => {
+  const m = toStr(v).match(/^\s*\[([^\]]+)\]/)
+  return m ? m[1].trim() : null
+}
 
 function parseNumber(input: any): number | null {
   if (input === null || input === undefined) return null
   let t = toStr(input).trim()
   if (!t) return null
-  // Support 1.234,56 style
+  // 1.234,56 style
   if (/,/.test(t) && !/\.\d+$/.test(t) && /,\d+$/.test(t)) {
     t = t.replace(/\./g, '').replace(',', '.')
   } else {
@@ -98,17 +107,15 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Rows
+    // Rows -> clean
     const rows = aoa.slice(1).filter(r => r && r.some((c: any) => toStr(c).trim() !== ''))
     if (!rows.length) return res.status(400).json({ error: 'No data rows found' })
 
     const clean: CleanRow[] = []
     const rejected: { row: number; reason: string }[] = []
     const reasonCounts = new Map<string, number>()
-    const reject = (row: number, reason: string) => {
-      rejected.push({ row, reason })
-      reasonCounts.set(reason, (reasonCounts.get(reason) || 0) + 1)
-    }
+    const bump = (reason: string) => reasonCounts.set(reason, (reasonCounts.get(reason) || 0) + 1)
+    const reject = (row: number, reason: string) => { rejected.push({ row, reason }); bump(reason) }
 
     rows.forEach((r, i) => {
       const rowNum = i + 2
@@ -134,38 +141,61 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Products map — STRICT exact normalized name match (expects "[####] Name" in Name)
+    // Fetch all products once
     const allProds = await supabaseService.from('products').select('id,name')
     if (allProds.error) return res.status(500).json({ error: allProds.error.message })
+    const prods = allProds.data ?? []
 
-    const byNormName = new Map<string, string>() // norm(name) -> product_id
-    for (const p of allProds.data ?? []) {
+    // Build three indexes:
+    // 1) exact name (normalized)
+    // 2) leading reference code (e.g., "46048" from "[46048] ...")
+    // 3) stripped leading tag (legacy)
+    const exactMap = new Map<string, string>()
+    const refMap   = new Map<string, string>()
+    const strippedMap = new Map<string, string>()
+
+    for (const p of prods) {
       const id = toStr(p.id)
-      const key = norm(p.name)
-      if (key && !byNormName.has(key)) byNormName.set(key, id)
+      const name = toStr(p.name)
+      const ek = norm(name)
+      const sk = norm(stripLeadingTag(name))
+      const ref = extractRef(name) // "46048" etc.
+
+      if (ek && !exactMap.has(ek)) exactMap.set(ek, id)
+      if (ref && !refMap.has(ref)) refMap.set(ref, id)
+      if (sk && !strippedMap.has(sk)) strippedMap.set(sk, id)
     }
 
-    type Resolved = CleanRow & { product_id?: string; matched_name?: string }
+    type Resolved = CleanRow & { product_id?: string; matched_name?: string; match_by?: 'exact'|'ref'|'stripped' }
     const resolved: Resolved[] = []
-    const unmatchedSamples: string[] = []
+    let noMatch = 0
 
     for (const r of clean) {
       const incoming = toStr(r.name)
-      const pid = byNormName.get(norm(incoming))
+      const byExact = exactMap.get(norm(incoming))
+      const ref = extractRef(incoming)
+      const byRef = ref ? refMap.get(ref) : undefined
+      const byStripped = strippedMap.get(norm(stripLeadingTag(incoming)))
+
+      const pid = byExact ?? byRef ?? byStripped
+      const how: 'exact'|'ref'|'stripped'|undefined = byExact ? 'exact' : (byRef ? 'ref' : (byStripped ? 'stripped' : undefined))
       if (!pid) {
-        if (unmatchedSamples.length < 25) unmatchedSamples.push(incoming)
-        rejected.push({ row: -1, reason: `No matching product for "${incoming}"` })
+        noMatch++
+        reject(-1, `No matching product for "${incoming}"`)
         continue
       }
-      const found = (allProds.data ?? []).find(p => toStr(p.id) === pid)
-      resolved.push({ ...r, product_id: pid, matched_name: toStr(found?.name ?? incoming) })
+      const found = prods.find(p => toStr(p.id) === pid)
+      resolved.push({
+        ...r,
+        product_id: pid,
+        matched_name: toStr(found?.name ?? incoming),
+        match_by: how!
+      })
     }
 
     if (!resolved.length) {
       return res.status(400).json({
-        error: 'No rows matched existing products (strict name match)',
-        hint: 'Ensure Name column contains the exact product name including the leading reference in [brackets].',
-        samples_unmatched: unmatchedSamples,
+        error: 'No rows matched existing products',
         rejectedCount: rejected.length,
         reasonCounts: Object.fromEntries(reasonCounts),
         sampleRejected: rejected.slice(0, 50)
@@ -195,7 +225,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Dedupe within the upload
+    // Collapse duplicates (keep the last occurrence in file)
     const uniqPrice = Array.from(
       pricePayload.reduce((m, row) => m.set(`${row.product_id}|${row.effective_date}`, row), new Map<string, PriceRow>()).values()
     )
@@ -217,13 +247,18 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     for (const part of chunk(uniqInv, 500)) {
       const ins2 = await supabaseService
         .from('inventory_current')
-        .upsert(part, { onConflict: 'product_id' }) // product_id is PK in your schema
+        .upsert(part, { onConflict: 'product_id' }) // assumes product_id is PK/unique
       if (ins2.error) return res.status(500).json({ error: ins2.error.message })
       invInserted += part.length
     }
 
     return res.json({
       matched_products: resolved.length,
+      matched_by: {
+        exact: resolved.filter(r => r.match_by === 'exact').length,
+        ref: resolved.filter(r => r.match_by === 'ref').length,
+        stripped: resolved.filter(r => r.match_by === 'stripped').length
+      },
       price_rows: priceInserted,
       inventory_rows: invInserted,
       collapsed_duplicates: {
@@ -233,7 +268,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
       sampleRejected: rejected.slice(0, 50),
-      unmatched_samples: unmatchedSamples
+      info: noMatch ? `${noMatch} row(s) could not be matched to a product.` : undefined
     })
   } catch (e: any) {
     console.error('UNHANDLED /api/inventory/upload error:', e)
