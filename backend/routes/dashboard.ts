@@ -73,16 +73,14 @@ router.get('/dashboard/overview', async (req, res) => {
       sales_12m_qty = (qtyQ.data ?? []).reduce((s: number, r: any) => s + Number(r.total_qty ?? 0), 0)
     }
 
-    // Revenue (12m): sum revenue_12m from product_kpis_12m  ✅ FIX
-    let sales_12m_revenue = 0
-    {
+    
+    
       const revQ = await supabaseService.from('product_kpis_12m').select('revenue_12m')
       if (revQ.error) return res.status(500).json({ error: revQ.error.message })
-      sales_12m_revenue = (revQ.data ?? []).reduce(
-        (s: number, r: any) => s + Number(r.revenue_12m ?? 0),
-        0
+      const sales_12m_revenue = (revQ.data ?? []).reduce(
+        (s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0
       )
-    }
+    
 
     // 3) Per-product monthly aggregation for MOQ
     const s12 = lastNMonthsScaffold(12)
@@ -122,34 +120,12 @@ router.get('/dashboard/overview', async (req, res) => {
       }
     }
 
-    // 4) INVENTORY: page through ALL rows (prevents missed on-hand values)
-    const onHandMap = new Map<string, number>()
-    {
-      const PAGE = 2000
-      let offset = 0
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        const inv = await supabaseService
-          .from('inventory_current')
-          .select('product_id,on_hand')
-          .range(offset, offset + PAGE - 1)
-
-        if (inv.error) return res.status(500).json({ error: inv.error.message })
-
-        const rows = inv.data ?? []
-        if (rows.length === 0) break
-
-        for (const r of rows as any[]) {
-          const pid = String(r.product_id)
-          if (!isUUID(pid)) continue
-          onHandMap.set(pid, Number(r.on_hand ?? 0))
-        }
-
-        if (rows.length < PAGE) break
-        offset += PAGE
-      }
-    }
-
+    const invQ = await supabaseService.from('inventory_current').select('product_id,on_hand')
+    if (invQ.error) return res.status(500).json({ error: invQ.error.message })
+    const onHandMap = new Map<string, number>(
+      (invQ.data ?? []).map((r: any) => [String(r.product_id), Number(r.on_hand ?? 0)])
+    )
+    
     // 5) Compute At-Risk (same MOQ formula as products.ts)
     type AtRiskRow = { product_id: string; on_hand: number; weighted_moq: number; gap: number }
     const pidSet = new Set<string>([
