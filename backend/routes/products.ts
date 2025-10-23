@@ -152,16 +152,6 @@ router.get('/products/list', async (req, res) => {
 })
 
 /* --------------------------- PRODUCT OVERVIEW --------------------------- */
-/**
- * GET /api/products/:id/overview
- * Query:
- *   mode=last12 | year
- *   year=YYYY (if mode=year)
- *
- * GP formula per your request:
- *   GP = (ASP - Current Unit Cost) * Qty_in_window
- *   where ASP = (Σ price*qty) / (Σ qty) within the same window
- */
 router.get('/products/:id/overview', async (req, res) => {
   try {
     const productId = String(req.params.id)
@@ -220,7 +210,7 @@ router.get('/products/:id/overview', async (req, res) => {
     }
     const aspWeighted = totalQty > 0 ? totalRevenue / totalQty : 0
 
-    // Current unit cost (0 if missing)
+    // Current unit cost/price (use view if present, else 0)
     const priceNow = await supabaseService
       .from('v_product_current_price')
       .select('unit_cost, unit_price, effective_date')
@@ -274,7 +264,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const sigma12 = stddev(buckets12.map(r => r.qty))
     const weighted_moq = Math.ceil(weightedAvg12 * ORDER_COVERAGE_MONTHS)
 
-    // Inventory now (for On hand KPI)
+    // Inventory now (for On hand KPI) — robust numeric conversion
     const inv = await supabaseService
       .from('inventory_current')
       .select('on_hand, backorder')
