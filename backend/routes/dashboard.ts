@@ -73,12 +73,15 @@ router.get('/dashboard/overview', async (req, res) => {
       sales_12m_qty = (qtyQ.data ?? []).reduce((s: number, r: any) => s + Number(r.total_qty ?? 0), 0)
     }
 
-    // Revenue (12m): sum revenue_12m from product_kpis_12m (same as your old code)
+    // Revenue (12m): sum revenue_12m from product_kpis_12m  ✅ FIX
     let sales_12m_revenue = 0
     {
-      const revQ = await supabaseService.from('v_product_profit_cache').select('revenue_12m')
+      const revQ = await supabaseService.from('product_kpis_12m').select('revenue_12m')
       if (revQ.error) return res.status(500).json({ error: revQ.error.message })
-      sales_12m_revenue = (revQ.data ?? []).reduce((s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0)
+      sales_12m_revenue = (revQ.data ?? []).reduce(
+        (s: number, r: any) => s + Number(r.revenue_12m ?? 0),
+        0
+      )
     }
 
     // 3) Per-product monthly aggregation for MOQ
