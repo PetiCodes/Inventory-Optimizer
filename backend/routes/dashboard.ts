@@ -39,7 +39,7 @@ const weights12 = Array.from({ length: 12 }, (_, i) => i + 1) // oldest=1 … ne
 const wSum12 = weights12.reduce((a, b) => a + b, 0)
 
 /** ───────────── Types ───────────── */
-type SaleRow = { product_id: string; quantity: number }
+type SaleRow = { product_id: string; quantity: number; unit_price: number | null }
 
 /** ───────────── Route ───────────── */
 router.get('/dashboard/overview', async (req, res) => {
@@ -59,59 +59,35 @@ router.get('/dashboard/overview', async (req, res) => {
     if (custHead.error) return res.status(500).json({ error: custHead.error.message })
     const customersCount = custHead.count ?? 0
 
-    // 2) KPI totals — last 12 months window (same as products.ts)
+    // 2) KPI totals — compute directly from sales in the last 12 full months
     const s12 = lastNMonthsScaffold(12)
     const startISO = monthStartUTC(s12[0].y, s12[0].m0).toISOString().slice(0, 10)
     const endISO = monthEndUTC(s12[s12.length - 1].y, s12[s12.length - 1].m0).toISOString().slice(0, 10)
 
-    const revQ = await supabaseService.from('product_kpis_12m').select('revenue_12m')
-    if (revQ.error) return res.status(500).json({ error: revQ.error.message })
-    const sales_12m_revenue = (revQ.data ?? []).reduce(
-      (s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0
-    )
-
-    const qtyQ = await supabaseService
-      .from('v_sales_monthly_total')
-      .select('month,total_qty')
-      .gte('month', startISO)
-      .lte('month', endISO)
-    if (qtyQ.error) return res.status(500).json({ error: qtyQ.error.message })
-    const sales_12m_qty = (qtyQ.data ?? []).reduce(
-      (s: number, r: any) => s + Number(r.total_qty ?? 0), 0
-    )
-
-    // 3) Aggregate ALL sales month-by-month with paging (no hidden row caps)
-    const perProdMonthly = new Map<string, number[]>() // pid -> [12]
-
-    const PAGE = 1000 // PostgREST typical max
-    for (let i = 0; i < 12; i++) {
-      const mStart = monthStartUTC(s12[i].y, s12[i].m0).toISOString().slice(0, 10)
-      const mEnd = monthEndUTC(s12[i].y, s12[i].m0).toISOString().slice(0, 10)
-
+    let sales_12m_qty = 0
+    let sales_12m_revenue = 0
+    {
+      const PAGE = 2000
       let offset = 0
-      // paginate within each month
       // eslint-disable-next-line no-constant-condition
       while (true) {
-        const batch = await supabaseService
+        const q = await supabaseService
           .from('sales')
-          .select('product_id,quantity')
-          .gte('date', mStart)
-          .lte('date', mEnd)
+          .select('quantity,unit_price')
+          .gte('date', startISO)
+          .lte('date', endISO)
           .range(offset, offset + PAGE - 1)
 
-        if (batch.error) {
-          return res.status(500).json({ error: batch.error.message })
-        }
+        if (q.error) return res.status(500).json({ error: q.error.message })
 
-        const rows = (batch.data ?? []) as SaleRow[]
+        const rows = (q.data ?? []) as SaleRow[]
         if (rows.length === 0) break
 
         for (const r of rows) {
-          const pid = String(r.product_id)
-          if (!isUUID(pid)) continue
-          const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
-          arr[i] += Number(r.quantity ?? 0)
-          perProdMonthly.set(pid, arr)
+          const qty = Number(r.quantity ?? 0)
+          const price = Number(r.unit_price ?? 0)
+          sales_12m_qty += qty
+          sales_12m_revenue += qty * price
         }
 
         if (rows.length < PAGE) break
@@ -119,7 +95,46 @@ router.get('/dashboard/overview', async (req, res) => {
       }
     }
 
-    // 4) Inventory snapshot
+    // 3) Aggregate ALL sales per product month-by-month (for MOQ calc)
+    const perProdMonthly = new Map<string, number[]>() // pid -> [12]
+    {
+      const PAGE = 1000
+      for (let i = 0; i < 12; i++) {
+        const mStart = monthStartUTC(s12[i].y, s12[i].m0).toISOString().slice(0, 10)
+        const mEnd = monthEndUTC(s12[i].y, s12[i].m0).toISOString().slice(0, 10)
+
+        let offset = 0
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const batch = await supabaseService
+            .from('sales')
+            .select('product_id,quantity')
+            .gte('date', mStart)
+            .lte('date', mEnd)
+            .range(offset, offset + PAGE - 1)
+
+          if (batch.error) {
+            return res.status(500).json({ error: batch.error.message })
+          }
+
+          const rows = (batch.data ?? []) as { product_id: string; quantity: number }[]
+          if (rows.length === 0) break
+
+          for (const r of rows) {
+            const pid = String(r.product_id)
+            if (!isUUID(pid)) continue
+            const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
+            arr[i] += Number(r.quantity ?? 0)
+            perProdMonthly.set(pid, arr)
+          }
+
+          if (rows.length < PAGE) break
+          offset += PAGE
+        }
+      }
+    }
+
+    // 4) Inventory snapshot (ensures on-hand is included for items with no sales)
     const invQ = await supabaseService.from('inventory_current').select('product_id,on_hand')
     if (invQ.error) return res.status(500).json({ error: invQ.error.message })
     const onHandMap = new Map<string, number>(
