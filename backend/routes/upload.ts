@@ -1,10 +1,11 @@
-// backend/routes/upload.ts
 import { Router } from 'express'
 import multer from 'multer'
 import xlsx from 'xlsx'
-import { supabaseService } from '../src/supabase.js'
+import { supabaseService } from '../src/supabase.js' // NodeNext: keep .js suffix
 
 const router = Router()
+
+// 30 MB is safe for large spreadsheets
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 }
@@ -21,22 +22,20 @@ function chunk<T>(arr: T[], size = 250): T[][] {
   return out
 }
 
-const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
-
-const norm = (v: any) =>
-  toStr(v).replace(/^\uFEFF/, '').trim().toLowerCase().replace(/\s+/g, ' ')
-
-const stripLeadingTag = (v: any) =>
-  toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
+function toStr(v: any): string {
+  return v === null || v === undefined ? '' : String(v)
+}
 
 function parseQuantity(v: any): number | null {
   if (v === null || v === undefined) return null
   let s = String(v).trim()
   if (!s) return null
+  // support “1.234,56” and “1,234.56”
   if (/,/.test(s) && !/\.\d+$/.test(s) && /,\d+$/.test(s)) {
-    s = s.replace(/\./g, '').replace(',', '.')
+    s = s.replace(/\./g, '')   // thousands
+    s = s.replace(',', '.')    // decimal
   } else {
-    s = s.replace(/[, ]/g, '')
+    s = s.replace(/[, ]/g, '') // thousands
   }
   const n = Number(s)
   return Number.isFinite(n) ? n : null
@@ -71,7 +70,7 @@ function excelSerialToISO(serial: number): string | null {
 function tryParseDateString(s: string): string | null {
   const t = s.trim()
   if (!t) return null
-  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t // YYYY-MM-DD
   const d = new Date(t)
   if (!isNaN(d.getTime())) {
     const yyyy = d.getFullYear()
@@ -92,31 +91,20 @@ function sheetToAOA(buf: Buffer): any[][] {
   return aoa
 }
 
-
 async function selectByNames(
   table: 'customers' | 'products',
-  names: string[],
-  column: 'name' | 'normalized_name' = 'name'
-): Promise<{ id: string; name: string; normalized_name?: string }[]> {
+  names: string[]
+): Promise<{ id: string; name: string }[]> {
   if (!names.length) return []
-
   const uniq = Array.from(new Set(names.filter(Boolean)))
-  const parts = chunk(uniq, 300)
-  const results: { id: string; name: string; normalized_name?: string }[] = []
-
+  const parts = chunk(uniq, 100)
+  const out: { id: string; name: string }[] = []
   for (const p of parts) {
-    // Use `any` chain to silence type recursion
-    const query: any = supabaseService
-      .from(table)
-      .select(column === 'name' ? 'id,name' : 'id,name,normalized_name')
-      .in(column, p)
-
-    const { data, error } = await query
-    if (error) throw error
-    if (Array.isArray(data)) results.push(...data)
+    const r: any = await supabaseService.from(table).select('id,name').in('name', p)
+    if (r.error) throw r.error
+    out.push(...(r.data ?? []))
   }
-
-  return results
+  return out
 }
 
 /* ----------------------------- route ---------------------------- */
@@ -138,7 +126,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const idx: Record<string, number> = {}
     headerRow.forEach((h, i) => { idx[toKey(h)] = i })
 
-    const missing = (['date','customer name','product','quantity'] as const).filter(k => idx[k] === undefined)
+    const missing = REQUIRED.filter(k => idx[k] === undefined)
     if (missing.length) {
       return res.status(400).json({
         error: 'Invalid headers. Expected: Date, Customer Name, Product, Quantity (Price optional)',
@@ -211,79 +199,48 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    /* ---------- master data handling ---------- */
-
-    // Customers: upsert (safe)
+    /* ------------------------------------------------------------
+       Upsert master data (customers/products)
+       - We also populate products.normalized_name (safe).
+       ------------------------------------------------------------ */
     const uniqueCustomers = Array.from(new Set(clean.map(r => r.Customer)))
-    const up1 = await supabaseService
+    const uniqueProducts  = Array.from(new Set(clean.map(r => r.Product)))
+
+    const up1: any = await supabaseService
       .from('customers')
       .upsert(uniqueCustomers.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
     if (up1.error) return res.status(500).json({ error: up1.error.message })
-    const custRows = await selectByNames('customers', uniqueCustomers, 'name')
+
+    const up2: any = await supabaseService
+      .from('products')
+      .upsert(
+        uniqueProducts.map(name => ({
+          name,
+          normalized_name: name.trim().toLowerCase().replace(/\s+/g, ' ')
+        })),
+        // allow updating normalized_name when name already exists
+        { onConflict: 'name', ignoreDuplicates: false }
+      )
+    if (up2.error) return res.status(500).json({ error: up2.error.message })
+
+    // Map names → ids
+    const custRows = await selectByNames('customers', uniqueCustomers)
+    const prodRows = await selectByNames('products', uniqueProducts)
     const custMap = new Map(custRows.map(c => [c.name, c.id]))
+    const prodMap = new Map(prodRows.map(p => [p.name, p.id]))
 
-    // Products: DO NOT CREATE here — inventory should have created them
-    const uniqueProducts = Array.from(new Set(clean.map(r => r.Product)))
-    const normalizedProducts = uniqueProducts.map(p => norm(p))
-
-    const prodExact = await selectByNames('products', uniqueProducts, 'name')
-    const prodNormRows = await selectByNames('products', Array.from(new Set(normalizedProducts)), 'normalized_name')
-
-    const byExact = new Map<string, string>() // name -> id
-    for (const r of prodExact) byExact.set(r.name, r.id)
-
-    // normalized_name must be unique per key to use
-    const normToIds = new Map<string, Set<string>>()
-    for (const r of prodNormRows) {
-      const key = norm(r.normalized_name ?? r.name)
-      if (!normToIds.has(key)) normToIds.set(key, new Set())
-      normToIds.get(key)!.add(r.id)
-    }
-
-    function resolveProductId(name: string): string | undefined {
-      const exact = byExact.get(name)
-      if (exact) return exact
-      const nn = norm(name)
-      const set = normToIds.get(nn)
-      if (set && set.size === 1) return Array.from(set)[0]
-      const sn = norm(stripLeadingTag(name))
-      const set2 = normToIds.get(sn)
-      if (set2 && set2.size === 1) return Array.from(set2)[0]
-      return undefined
-    }
-
-    // Build sales payload (only mapped rows)
-    const salesPayload: Array<{
-      date: string
-      quantity: number
-      unit_price: number | null
-      customer_id: string
-      product_id: string
-    }> = []
-
-    for (let i = 0; i < clean.length; i++) {
-      const r = clean[i]
-      const rowNum = i + 2
-      const cid = custMap.get(r.Customer)
-      const pid = resolveProductId(r.Product)
-
-      if (!cid) {
-        reject(rowNum, `Unknown Customer "${r.Customer}"`)
-        continue
-      }
-      if (!pid) {
-        reject(rowNum, `Unknown Product "${r.Product}" (not found; import via inventory first)`)
-        continue
-      }
-
-      salesPayload.push({
+    // Build sales payload (no dedupe, simple insert)
+    const salesPayload = clean
+      .map(r => ({
         date: r.Date,
         quantity: r.Quantity,
-        unit_price: r.Price,
-        customer_id: cid,
-        product_id: pid
-      })
-    }
+        unit_price: r.Price, // may be null
+        customer_id: custMap.get(r.Customer) as string | undefined,
+        product_id: prodMap.get(r.Product) as string | undefined
+      }))
+      .filter(x => x.customer_id && x.product_id) as Array<{
+        date: string; quantity: number; unit_price: number | null; customer_id: string; product_id: string;
+      }>
 
     if (!salesPayload.length) {
       return res.status(400).json({
@@ -298,7 +255,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const batches = chunk(salesPayload, 250)
     let inserted = 0
     for (const b of batches) {
-      const ins = await supabaseService.from('sales').insert(b, { count: 'exact' })
+      const ins: any = await supabaseService.from('sales').insert(b, { count: 'exact' })
       if (ins.error) {
         return res.status(500).json({ error: ins.error.message, inserted })
       }
