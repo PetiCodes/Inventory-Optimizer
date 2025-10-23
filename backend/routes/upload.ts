@@ -92,31 +92,31 @@ function sheetToAOA(buf: Buffer): any[][] {
   return aoa
 }
 
-/**
- * Fetch rows by a list of names against either "name" or "normalized_name".
- * NOTE: we cast the select string and result to `any` to avoid Supabase's
- * type parser producing a ParserError type at compile time.
- */
+
 async function selectByNames(
   table: 'customers' | 'products',
   names: string[],
   column: 'name' | 'normalized_name' = 'name'
 ): Promise<{ id: string; name: string; normalized_name?: string }[]> {
   if (!names.length) return []
+
   const uniq = Array.from(new Set(names.filter(Boolean)))
   const parts = chunk(uniq, 300)
-  const out: { id: string; name: string; normalized_name?: string }[] = []
+  const results: { id: string; name: string; normalized_name?: string }[] = []
+
   for (const p of parts) {
-    const selectCols =
-      column === 'name' ? ('id,name' as any) : ('id,name,normalized_name' as any)
-    const r: any = await supabaseService
+    // Use `any` chain to silence type recursion
+    const query: any = supabaseService
       .from(table)
-      .select(selectCols)
-      .in(column as any, p)
-    if (r.error) throw r.error
-    out.push(...((r.data ?? []) as any[]))
+      .select(column === 'name' ? 'id,name' : 'id,name,normalized_name')
+      .in(column, p)
+
+    const { data, error } = await query
+    if (error) throw error
+    if (Array.isArray(data)) results.push(...data)
   }
-  return out
+
+  return results
 }
 
 /* ----------------------------- route ---------------------------- */
