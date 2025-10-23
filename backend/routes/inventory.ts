@@ -10,14 +10,21 @@ const upload = multer({
 })
 
 /* -------------------------- helpers -------------------------- */
+
 const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
 
 const norm = (v: any) =>
   toStr(v).replace(/^\uFEFF/, '').trim().toLowerCase().replace(/\s+/g, ' ')
 
-// keep for display / legacy matching if needed later
+// Remove leading "[...]" tag in names
 const stripLeadingTag = (v: any) =>
   toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
+
+// Extract the content inside the very first leading [ ... ] if present
+const extractRef = (v: any): string | null => {
+  const m = toStr(v).match(/^\s*\[([^\]]+)\]/)
+  return m ? m[1].trim() : null
+}
 
 function parseNumber(input: any): number | null {
   if (input === null || input === undefined) return null
@@ -33,7 +40,8 @@ function parseNumber(input: any): number | null {
   return Number.isFinite(n) ? n : null
 }
 
-function chunk<T>(arr: T[], size = 500): T[][] {
+// Use smaller default chunk size to avoid gateway resets
+function chunk<T>(arr: T[], size = 120): T[][] {
   const out: T[][] = []
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
   return out
@@ -55,7 +63,7 @@ const ALIASES: Record<(typeof REQUIRED)[number], string[]> = {
   'name': [],
   'sales price': ['sales price (current)'],
   'cost': [],
-  'quantity on hand': ['quantity on hand (stocks)'],
+  'quantity on hand': ['quantity on hand (stocks)']
 }
 
 type CleanRow = {
@@ -63,6 +71,48 @@ type CleanRow = {
   unit_price: number
   unit_cost: number
   on_hand: number
+}
+
+/* --------------------- retry + diagnostics -------------------- */
+
+// Basic sleep
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+// Wrap Supabase calls to survive transient network errors
+async function callWithRetry<T>(
+  fn: () => Promise<{ data: T; error: any }>,
+  label: string,
+  attemptMax = 3
+): Promise<{ data: T; error: any; attempts: number }> {
+  let lastErr: any = null
+  for (let attempt = 1; attempt <= attemptMax; attempt++) {
+    try {
+      const res = await fn()
+      if (res.error) {
+        lastErr = res.error
+      } else {
+        return { ...res, attempts: attempt }
+      }
+    } catch (e: any) {
+      // This is where "TypeError: fetch failed" shows up
+      lastErr = e
+    }
+    const backoff = Math.min(1500 * attempt, 3000) + Math.floor(Math.random() * 250)
+    console.warn(`[inventory.upload] ${label} attempt ${attempt} failed:`, lastErr?.message || lastErr)
+    if (attempt < attemptMax) await sleep(backoff)
+  }
+  return { data: [] as any, error: lastErr, attempts: attemptMax }
+}
+
+// Quick connectivity probe (fast metadata call)
+async function supabasePing(): Promise<{ ok: boolean; detail?: string }> {
+  try {
+    const { error } = await supabaseService.from('products').select('id', { head: true, count: 'exact' })
+    if (error) return { ok: false, detail: error.message }
+    return { ok: true }
+  } catch (e: any) {
+    return { ok: false, detail: e?.message || String(e) }
+  }
 }
 
 /* --------------------------- route --------------------------- */
@@ -73,7 +123,13 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'File is required (field name "file")' })
     }
 
-    // 1) Parse file
+    // Connectivity probe up front (helps distinguish auth/network vs parsing issues)
+    const ping = await supabasePing()
+    if (!ping.ok) {
+      return res.status(502).json({ error: 'Cannot reach database (preflight)', detail: ping.detail })
+    }
+
+    // Parse file
     let aoa: any[][]
     try {
       aoa = sheetToAOA(req.file.buffer)
@@ -81,7 +137,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Unable to parse file. Use .xlsx/.xls/.csv with headers.' })
     }
 
-    // 2) Header map
+    // Map headers
     const headerRow = (aoa[0] ?? []).map(h => toStr(h))
     const idx: Record<(typeof REQUIRED)[number], number> = {
       'name': -1, 'sales price': -1, 'cost': -1, 'quantity on hand': -1
@@ -96,11 +152,11 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     if (missing.length) {
       return res.status(400).json({
         error: 'Invalid headers. Expected: Name, Sales Price, Cost, Quantity On Hand',
-        details: { received: headerRow, missing },
+        details: { received: headerRow, missing }
       })
     }
 
-    // 3) Validate rows -> Clean
+    // Rows -> clean
     const rows = aoa.slice(1).filter(r => r && r.some((c: any) => toStr(c).trim() !== ''))
     if (!rows.length) return res.status(400).json({ error: 'No data rows found' })
 
@@ -130,66 +186,72 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
         error: 'No valid rows to import',
         rejectedCount: rejected.length,
         reasonCounts: Object.fromEntries(reasonCounts),
-        sampleRejected: rejected.slice(0, 50),
+        sampleRejected: rejected.slice(0, 50)
       })
     }
 
-    // 4) PREP: Ensure all products exist (CREATE MISSING)
-    // Build a unique set of names (use normalized_name to prevent dup noise)
-    const byNormName = new Map<string, string>() // normalized_name -> original Name to insert
-    for (const r of clean) {
-      const nn = norm(r.name)
-      if (!byNormName.has(nn)) byNormName.set(nn, r.name)
+    // Fetch all products once (with retry)
+    const prodSel = await callWithRetry(
+      () => supabaseService.from('products').select('id,name'),
+      'select products'
+    )
+    if (prodSel.error) {
+      return res.status(502).json({ error: 'Failed to read products', detail: prodSel.error?.message || String(prodSel.error) })
     }
-    const uniqueNames = Array.from(byNormName.values())
+    const prods = (prodSel.data as any[]) ?? []
 
-    // Upsert products by unique (name). Also set normalized_name for future use.
-    let productsUpserted = 0
-    for (const part of chunk(uniqueNames, 500)) {
-      const payload = part.map(n => ({ name: n, normalized_name: norm(n) }))
-      const ins = await supabaseService
-        .from('products')
-        .upsert(payload, { onConflict: 'name' }) // UNIQUE(name) in your schema
-        .select('id') // selecting to avoid "head" behavior
-      if (ins.error) return res.status(500).json({ error: ins.error.message })
-      productsUpserted += payload.length
-    }
+    // Build indexes: exact name, reference code, stripped name (legacy)
+    const exactMap = new Map<string, string>()
+    const refMap   = new Map<string, string>()
+    const strippedMap = new Map<string, string>()
 
-    // 5) Build a name->id map for all names we need
-    const nameToId = new Map<string, string>()
-    for (const part of chunk(uniqueNames, 500)) {
-      const q = await supabaseService
-        .from('products')
-        .select('id,name')
-        .in('name', part)
-      if (q.error) return res.status(500).json({ error: q.error.message })
-      for (const p of q.data ?? []) nameToId.set(toStr(p.name), toStr(p.id))
+    for (const p of prods) {
+      const id = toStr(p.id)
+      const name = toStr(p.name)
+      const ek = norm(name)
+      const sk = norm(stripLeadingTag(name))
+      const ref = extractRef(name)
+      if (ek && !exactMap.has(ek)) exactMap.set(ek, id)
+      if (ref && !refMap.has(ref)) refMap.set(ref, id)
+      if (sk && !strippedMap.has(sk)) strippedMap.set(sk, id)
     }
 
-    // 6) Resolve every clean row to a product_id (must exist now)
-    type Resolved = CleanRow & { product_id: string }
+    type Resolved = CleanRow & { product_id?: string; matched_name?: string; match_by?: 'exact'|'ref'|'stripped' }
     const resolved: Resolved[] = []
-    let missingAfterUpsert = 0
+    let noMatch = 0
+
     for (const r of clean) {
-      const pid = nameToId.get(r.name)
+      const incoming = toStr(r.name)
+      const byExact = exactMap.get(norm(incoming))
+      const ref = extractRef(incoming)
+      const byRef = ref ? refMap.get(ref) : undefined
+      const byStripped = strippedMap.get(norm(stripLeadingTag(incoming)))
+      const pid = byExact ?? byRef ?? byStripped
+      const how: 'exact'|'ref'|'stripped'|undefined = byExact ? 'exact' : (byRef ? 'ref' : (byStripped ? 'stripped' : undefined))
       if (!pid) {
-        missingAfterUpsert++
-        reject(-1, `Product not found after upsert for "${r.name}"`)
+        noMatch++
+        reject(-1, `No matching product for "${incoming}"`)
         continue
       }
-      resolved.push({ ...r, product_id: pid })
+      const found = prods.find(p => toStr(p.id) === pid)
+      resolved.push({
+        ...r,
+        product_id: pid,
+        matched_name: toStr(found?.name ?? incoming),
+        match_by: how!
+      })
     }
 
     if (!resolved.length) {
       return res.status(400).json({
-        error: 'No rows could be linked to products after upsert',
+        error: 'No rows matched existing products',
         rejectedCount: rejected.length,
         reasonCounts: Object.fromEntries(reasonCounts),
-        sampleRejected: rejected.slice(0, 50),
+        sampleRejected: rejected.slice(0, 50)
       })
     }
 
-    // 7) Build payloads for product_prices & inventory_current
+    // Build payloads
     type PriceRow = { product_id: string; effective_date: string; unit_cost: number; unit_price: number }
     type InvRow   = { product_id: string; on_hand: number; backorder?: number }
 
@@ -198,20 +260,21 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const invPayload:   InvRow[]   = []
 
     for (const r of resolved) {
+      const pid = toStr(r.product_id)
       pricePayload.push({
-        product_id: r.product_id,
+        product_id: pid,
         effective_date: todayISO,
         unit_cost: Number(r.unit_cost) || 0,
-        unit_price: Number(r.unit_price) || 0,
+        unit_price: Number(r.unit_price) || 0
       })
       invPayload.push({
-        product_id: r.product_id,
+        product_id: pid,
         on_hand: Number(r.on_hand) || 0,
-        backorder: 0,
+        backorder: 0
       })
     }
 
-    // 8) Collapse duplicates within this file (keep last occurrence)
+    // Collapse duplicates (keep last occurrence)
     const uniqPrice = Array.from(
       pricePayload.reduce((m, row) => m.set(`${row.product_id}|${row.effective_date}`, row), new Map<string, PriceRow>()).values()
     )
@@ -219,41 +282,62 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       invPayload.reduce((m, row) => m.set(row.product_id, row), new Map<string, InvRow>()).values()
     )
 
-    // 9) Upserts (batched)
+    // Upserts with retry & smaller batches
     let priceInserted = 0
-    for (const part of chunk(uniqPrice, 500)) {
-      const ins = await supabaseService
-        .from('product_prices')
-        .upsert(part, { onConflict: 'product_id,effective_date' })
-      if (ins.error) return res.status(500).json({ error: ins.error.message })
-      priceInserted += part.length
+    const priceBatches = chunk(uniqPrice, 120)
+    for (let i = 0; i < priceBatches.length; i++) {
+      const batch = priceBatches[i]
+      const label = `upsert product_prices (batch ${i + 1}/${priceBatches.length}, rows ${batch.length})`
+      const r = await callWithRetry(
+        () => supabaseService.from('product_prices').upsert(batch, { onConflict: 'product_id,effective_date' }),
+        label
+      )
+      if (r.error) {
+        return res.status(502).json({
+          error: 'Failed to upsert product_prices',
+          detail: r.error?.message || String(r.error),
+          batch: i + 1, batchRows: batch.length
+        })
+      }
+      priceInserted += batch.length
     }
 
     let invInserted = 0
-    for (const part of chunk(uniqInv, 500)) {
-      const ins2 = await supabaseService
-        .from('inventory_current')
-        .upsert(part, { onConflict: 'product_id' }) // product_id is PK/unique
-      if (ins2.error) return res.status(500).json({ error: ins2.error.message })
-      invInserted += part.length
+    const invBatches = chunk(uniqInv, 120)
+    for (let i = 0; i < invBatches.length; i++) {
+      const batch = invBatches[i]
+      const label = `upsert inventory_current (batch ${i + 1}/${invBatches.length}, rows ${batch.length})`
+      const r = await callWithRetry(
+        () => supabaseService.from('inventory_current').upsert(batch, { onConflict: 'product_id' }),
+        label
+      )
+      if (r.error) {
+        return res.status(502).json({
+          error: 'Failed to upsert inventory_current',
+          detail: r.error?.message || String(r.error),
+          batch: i + 1, batchRows: batch.length
+        })
+      }
+      invInserted += batch.length
     }
 
-    // 10) Respond
     return res.json({
-      products_upserted_from_file: productsUpserted,  // number of names considered in upsert (not distinct inserted)
       matched_products: resolved.length,
+      matched_by: {
+        exact: resolved.filter(r => r.match_by === 'exact').length,
+        ref: resolved.filter(r => r.match_by === 'ref').length,
+        stripped: resolved.filter(r => r.match_by === 'stripped').length
+      },
       price_rows: priceInserted,
       inventory_rows: invInserted,
       collapsed_duplicates: {
         product_prices: pricePayload.length - uniqPrice.length,
-        inventory_current: invPayload.length - uniqInv.length,
+        inventory_current: invPayload.length - uniqInv.length
       },
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
       sampleRejected: rejected.slice(0, 50),
-      info: missingAfterUpsert
-        ? `${missingAfterUpsert} row(s) still missing after product upsert (unexpected).`
-        : undefined,
+      info: noMatch ? `${noMatch} row(s) could not be matched to a product.` : undefined
     })
   } catch (e: any) {
     console.error('UNHANDLED /api/inventory/upload error:', e)
