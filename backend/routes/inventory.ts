@@ -107,7 +107,9 @@ async function callWithRetry<T>(
 // Quick connectivity probe (fast metadata call)
 async function supabasePing(): Promise<{ ok: boolean; detail?: string }> {
   try {
-    const { error } = await supabaseService.from('products').select('id', { head: true, count: 'exact' })
+    const { error } = await supabaseService
+      .from('products')
+      .select('id', { head: true, count: 'exact' })
     if (error) return { ok: false, detail: error.message }
     return { ok: true }
   } catch (e: any) {
@@ -190,9 +192,9 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Fetch all products once (with retry)
+    // Fetch all products once (with retry) — NOTE the async + await here
     const prodSel = await callWithRetry(
-      () => supabaseService.from('products').select('id,name'),
+      async () => await supabaseService.from('products').select('id,name'),
       'select products'
     )
     if (prodSel.error) {
@@ -282,14 +284,17 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       invPayload.reduce((m, row) => m.set(row.product_id, row), new Map<string, InvRow>()).values()
     )
 
-    // Upserts with retry & smaller batches
+    // Upserts with retry & smaller batches — NOTE async + await
     let priceInserted = 0
     const priceBatches = chunk(uniqPrice, 120)
     for (let i = 0; i < priceBatches.length; i++) {
       const batch = priceBatches[i]
       const label = `upsert product_prices (batch ${i + 1}/${priceBatches.length}, rows ${batch.length})`
       const r = await callWithRetry(
-        () => supabaseService.from('product_prices').upsert(batch, { onConflict: 'product_id,effective_date' }),
+        async () =>
+          await supabaseService
+            .from('product_prices')
+            .upsert(batch, { onConflict: 'product_id,effective_date' }),
         label
       )
       if (r.error) {
@@ -308,7 +313,10 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       const batch = invBatches[i]
       const label = `upsert inventory_current (batch ${i + 1}/${invBatches.length}, rows ${batch.length})`
       const r = await callWithRetry(
-        () => supabaseService.from('inventory_current').upsert(batch, { onConflict: 'product_id' }),
+        async () =>
+          await supabaseService
+            .from('inventory_current')
+            .upsert(batch, { onConflict: 'product_id' }),
         label
       )
       if (r.error) {
