@@ -13,12 +13,22 @@ const upload = multer({
 
 const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
 
-const norm = (v: any) =>
-  toStr(v).replace(/^\uFEFF/, '').trim().toLowerCase().replace(/\s+/g, ' ')
+/** Collapse internal whitespace, strip BOM, lowercase (when needed) */
+const collapseSpaces = (s: string) => s.replace(/\s+/g, ' ')
+const stripBOM = (s: string) => s.replace(/^\uFEFF/, '')
 
-// Keep — some legacy sheets may still have stray tags
+/** Normalizes leading [tag] if present and trims */
 const stripLeadingTag = (v: any) =>
   toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
+
+/** Canonical name used when building maps (for safety only) */
+function canonName(s: string) {
+  const trimmed = stripBOM(toStr(s)).trim()
+  // handle weird bracket variants like 【123】 or fullwidth brackets
+  const normalizedBrackets = trimmed
+    .replace(/^\s*[［\[]([^］\]]+)[］\]]\s*/, '[$1] ')
+  return collapseSpaces(normalizedBrackets)
+}
 
 function parseNumber(input: any): number | null {
   if (input === null || input === undefined) return null
@@ -35,7 +45,7 @@ function parseNumber(input: any): number | null {
   return Number.isFinite(n) ? n : null
 }
 
-function chunk<T>(arr: T[], size = 100): T[][] {
+function chunk<T>(arr: T[], size = 75): T[][] {
   const out: T[][] = []
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
   return out
@@ -94,7 +104,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const idx: Record<(typeof REQUIRED)[number], number> = {
       'name': -1, 'sales price': -1, 'cost': -1, 'quantity on hand': -1
     }
-    headerRow.map(h => norm(h)).forEach((nh, i) => {
+    headerRow.map(h => toStr(h).trim().toLowerCase().replace(/\s+/g, ' ')).forEach((nh, i) => {
       for (const key of REQUIRED) {
         if (idx[key] !== -1) continue
         if (nh === key || ALIASES[key].includes(nh)) idx[key] = i
@@ -108,11 +118,11 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Rows
+    // Rows (skip fully empty)
     const rows = aoa.slice(1).filter(r => r && r.some((c: any) => toStr(c).trim() !== ''))
     if (!rows.length) return res.status(400).json({ error: 'No data rows found' })
 
-    // Clean
+    // Clean + canonicalize names
     const clean: CleanRow[] = []
     const rejected: { row: number; reason: string }[] = []
     const reasonCounts = new Map<string, number>()
@@ -123,7 +133,8 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     rows.forEach((r, i) => {
       const rowNum = i + 2
-      const name  = toStr(r[idx['name']]).trim()
+      const rawName = toStr(r[idx['name']])
+      const name = canonName(rawName)
       const price = parseNumber(r[idx['sales price']])
       const cost  = parseNumber(r[idx['cost']])
       const onH   = parseNumber(r[idx['quantity on hand']])
@@ -147,13 +158,12 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     // 1) Ensure products exist (create new if missing)
     const uniqueNames = Array.from(new Set(clean.map(r => r.name)))
-    for (const part of chunk(uniqueNames, 100)) {
+    for (const part of chunk(uniqueNames, 75)) {
       const up = await supabaseService
         .from('products')
         .upsert(part.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
-      if (up.error) return res.status(500).json({ error: up.error.message, stage })
+      if (up.error) return res.status(500).json({ error: up.error.message, stage, step: 'upsert_products' })
       stage.upsertProducts += part.length
-      // small yield
       await sleep(5)
     }
 
@@ -161,13 +171,13 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const nameToId = new Map<string, string>()
     for (const part of chunk(uniqueNames, 100)) {
       const sel = await supabaseService.from('products').select('id,name').in('name', part)
-      if (sel.error) return res.status(500).json({ error: sel.error.message, stage })
+      if (sel.error) return res.status(500).json({ error: sel.error.message, stage, step: 'map_products' })
       for (const p of sel.data ?? []) nameToId.set(String(p.name), String(p.id))
       stage.mapProducts += sel.data?.length ?? 0
       await sleep(3)
     }
 
-    // 3) Build payloads (defensively coerce to numbers)
+    // 3) Build payloads with defensive coercion
     type PriceRow = { product_id: string; effective_date: string; unit_cost: number; unit_price: number }
     type InvRow   = { product_id: string; on_hand: number; backorder?: number }
 
@@ -198,7 +208,7 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       })
     }
 
-    // Collapse duplicates by (product_id|effective_date) and product_id
+    // Collapse duplicates by (product_id|effective_date) and product_id (keep last)
     const uniqPrice = Array.from(
       pricePayload.reduce((m, row) => m.set(`${row.product_id}|${row.effective_date}`, row), new Map<string, PriceRow>()).values()
     )
@@ -206,37 +216,37 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       invPayload.reduce((m, row) => m.set(row.product_id, row), new Map<string, InvRow>()).values()
     )
 
-    // 4) Upsert PRICES in tiny batches
+    // 4) Upsert PRICES (small batches + sleep)
     let priceInserted = 0
-    for (const part of chunk(uniqPrice, 100)) {
+    for (const part of chunk(uniqPrice, 75)) {
       try {
         const ins = await supabaseService
           .from('product_prices')
           .upsert(part, { onConflict: 'product_id,effective_date' })
         if (ins.error) {
-          // surface the exact failing rows
           return res.status(500).json({
             error: ins.error.message,
             failingSample: part.slice(0, 5),
-            stage
+            stage,
+            step: 'upsert_prices'
           })
         }
         priceInserted += part.length
         stage.priceBatches++
-        await sleep(5)
+        await sleep(6)
       } catch (err: any) {
-        // prevents “fetch failed” at the frontend
         return res.status(500).json({
           error: err?.message || 'Failed inserting product_prices',
           failingSample: part.slice(0, 5),
-          stage
+          stage,
+          step: 'upsert_prices_catch'
         })
       }
     }
 
-    // 5) Upsert INVENTORY in tiny batches
+    // 5) Upsert INVENTORY (small batches + sleep)
     let invInserted = 0
-    for (const part of chunk(uniqInv, 100)) {
+    for (const part of chunk(uniqInv, 75)) {
       try {
         const ins2 = await supabaseService
           .from('inventory_current')
@@ -245,18 +255,52 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
           return res.status(500).json({
             error: ins2.error.message,
             failingSample: part.slice(0, 5),
-            stage
+            stage,
+            step: 'upsert_inventory'
           })
         }
         invInserted += part.length
         stage.invBatches++
-        await sleep(5)
+        await sleep(6)
       } catch (err: any) {
         return res.status(500).json({
           error: err?.message || 'Failed inserting inventory_current',
           failingSample: part.slice(0, 5),
-          stage
+          stage,
+          step: 'upsert_inventory_catch'
         })
+      }
+    }
+
+    // 6) VERIFY & RETRY (important): ensure every product in this upload has an inventory row
+    const uploadedPids = Array.from(new Set(uniqInv.map(r => r.product_id)))
+    const existingInv = new Set<string>()
+    for (const part of chunk(uploadedPids, 200)) {
+      const q = await supabaseService.from('inventory_current').select('product_id').in('product_id', part)
+      if (q.error) {
+        // Non-fatal, just report in response
+        break
+      }
+      for (const r of q.data ?? []) existingInv.add(String((r as any).product_id))
+      await sleep(3)
+    }
+
+    const missingPids = uploadedPids.filter(pid => !existingInv.has(pid))
+    const retried: string[] = []
+    const retryFailed: { product_id: string; reason: string }[] = []
+
+    if (missingPids.length) {
+      // retry one-by-one to avoid masking a few stubborn rows
+      for (const pid of missingPids) {
+        const row = uniqInv.find(r => r.product_id === pid)
+        if (!row) continue
+        const attempt = await supabaseService.from('inventory_current').upsert(row, { onConflict: 'product_id' })
+        if (attempt.error) {
+          retryFailed.push({ product_id: pid, reason: attempt.error.message })
+        } else {
+          retried.push(pid)
+        }
+        await sleep(2)
       }
     }
 
@@ -267,6 +311,13 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
       collapsed_duplicates: {
         product_prices: pricePayload.length - uniqPrice.length,
         inventory_current: invPayload.length - uniqInv.length
+      },
+      verify: {
+        uploaded_products: uploadedPids.length,
+        found_inventory_rows: existingInv.size,
+        missing_before_retry: missingPids.length,
+        retried_success: retried.length,
+        retry_failed: retryFailed
       },
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
