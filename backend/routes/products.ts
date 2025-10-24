@@ -4,17 +4,11 @@ import { supabaseService } from '../src/supabase.js'
 const router = Router()
 
 /* ------------------------------ Utilities ------------------------------ */
-function toInt(v: any, d: number) {
-  const n = Number(v)
-  return Number.isFinite(n) ? n : d
-}
-
-/* -------------------- date helpers (UTC, month-aligned) -------------------- */
 function monthStartUTC(y: number, m0: number) {
   return new Date(Date.UTC(y, m0, 1))
 }
 function monthEndUTC(y: number, m0: number) {
-  return new Date(Date.UTC(y, m0 + 1, 0)) // day 0 of next month == last day of this month
+  return new Date(Date.UTC(y, m0 + 1, 0))
 }
 function ymKeyUTC(d: Date): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
@@ -69,14 +63,54 @@ router.get('/products/list', async (req, res) => {
   try {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const limit = Math.max(1, Math.min(Number(req.query.limit ?? 20), 200))
-    const gpOrder = String(req.query.gp_order ?? 'none') // 'none', 'desc', 'asc'
-    const ohOrder = String(req.query.oh_order ?? 'none') // 'none', 'desc', 'asc'
+    const gpOrder = String(req.query.gp_order ?? 'none') // 'none' | 'asc' | 'desc'
+    const ohOrder = String(req.query.oh_order ?? 'none') // 'none' | 'asc' | 'desc'
     const q = String(req.query.q ?? '').trim()
 
     const from = (page - 1) * limit
     const to = from + limit - 1
 
-    // Get products with inventory data for on-hand sorting
+    // INVENTORY-DRIVEN branch: sort by on_hand using the SQL view (no client stitching)
+    if (ohOrder !== 'none') {
+      const ohAsc = ohOrder === 'asc'
+      const gpAsc = gpOrder === 'asc'
+
+      let viewQ = supabaseService
+        .from('v_products_onhand')
+        .select('product_id, product_name, on_hand, qty_12m, revenue_12m, gross_profit_12m', { count: 'exact' })
+
+      if (q) viewQ = viewQ.ilike('product_name', `%${q}%`)
+
+      // Primary sort: if gpOrder requested, apply it first; then on_hand as secondary.
+      if (gpOrder !== 'none') {
+        viewQ = viewQ.order('gross_profit_12m', { ascending: gpAsc, nullsFirst: gpAsc })
+      }
+      viewQ = viewQ.order('on_hand', { ascending: ohAsc, nullsFirst: ohAsc })
+
+      viewQ = viewQ.range(from, to)
+
+      const { data, error, count } = await viewQ
+      if (error) return res.status(500).json({ error: error.message })
+
+      const items = (data ?? []).map(r => ({
+        id: String(r.product_id),
+        name: (r.product_name || '').trim() || '(unknown product)',
+        qty_12m: Number(r.qty_12m ?? 0),
+        revenue_12m: Number(r.revenue_12m ?? 0),
+        gross_profit_12m: Number(r.gross_profit_12m ?? 0),
+        on_hand: Number(r.on_hand ?? 0),
+      }))
+
+      return res.json({
+        page,
+        limit,
+        total: count ?? items.length,
+        pages: Math.max(1, Math.ceil((count ?? items.length) / limit)),
+        items,
+      })
+    }
+
+    // GP-driven/default branch (kept as your original, DB-side join via view)
     let builder = supabaseService
       .from('v_product_profit_cache')
       .select(`
@@ -85,131 +119,32 @@ router.get('/products/list', async (req, res) => {
         qty_12m, 
         revenue_12m, 
         gross_profit_12m,
-        inventory_current!inner(on_hand)
+        inventory_current(on_hand)
       `, { count: 'exact' })
 
     if (q) builder = builder.ilike('product_name', `%${q}%`)
 
-    // Apply sorting based on active filters
-    if (gpOrder !== 'none' && ohOrder !== 'none') {
-      // Both filters active: primary sort by gross profit, secondary by on-hand
-      const gpAsc = gpOrder === 'asc'
-      const ohAsc = ohOrder === 'asc'
-      builder = builder
-        .order('gross_profit_12m', { ascending: gpAsc })
-        .order('inventory_current.on_hand', { ascending: ohAsc })
-    } else if (gpOrder !== 'none') {
-      // Only gross profit filter active
+    if (gpOrder !== 'none') {
       const gpAsc = gpOrder === 'asc'
       builder = builder.order('gross_profit_12m', { ascending: gpAsc })
-    } else if (ohOrder !== 'none') {
-      // Only on-hand filter active
-      const ohAsc = ohOrder === 'asc'
-      builder = builder.order('inventory_current.on_hand', { ascending: ohAsc })
     } else {
-      // Default: alphabetical by product name
       builder = builder.order('product_name', { ascending: true })
     }
 
     builder = builder.range(from, to)
 
     const viewRes = await builder
+    if (viewRes.error) return res.status(500).json({ error: viewRes.error.message })
 
-    if (!viewRes.error) {
-      const total = viewRes.count ?? (viewRes.data?.length ?? 0)
-      const items = (viewRes.data ?? []).map((r: any) => ({
-        id: String(r.product_id),
-        name: String(r.product_name ?? '').trim() || '(unknown product)',
-        qty_12m: Number(r.qty_12m ?? 0),
-        revenue_12m: Number(r.revenue_12m ?? 0),
-        gross_profit_12m: Number(r.gross_profit_12m ?? 0),
-        on_hand: Number(r.inventory_current?.on_hand ?? 0),
-      }))
-      return res.json({
-        page,
-        limit,
-        total,
-        pages: Math.max(1, Math.ceil(total / limit)),
-        items,
-      })
-    }
-
-    // Fallback: table + names + inventory
-    let idFilter: string[] | null = null
-    if (q) {
-      const nameRes = await supabaseService
-        .from('products')
-        .select('id,name')
-        .ilike('name', `%${q}%`)
-      if (nameRes.error) return res.status(500).json({ error: nameRes.error.message })
-      idFilter = (nameRes.data ?? []).map(r => String(r.id))
-      if (idFilter.length === 0) {
-        return res.json({ page, limit, total: 0, pages: 1, items: [] })
-      }
-    }
-
-    // Get profit data
-    let cacheQ = supabaseService
-      .from('product_profit_cache')
-      .select('product_id, qty_12m, revenue_12m, gross_profit_12m', { count: 'exact' })
-    if (idFilter) cacheQ = cacheQ.in('product_id', idFilter)
-    
-    // Apply sorting for fallback
-    if (gpOrder !== 'none' && ohOrder !== 'none') {
-      const gpAsc = gpOrder === 'asc'
-      cacheQ = cacheQ.order('gross_profit_12m', { ascending: gpAsc })
-    } else if (gpOrder !== 'none') {
-      const gpAsc = gpOrder === 'asc'
-      cacheQ = cacheQ.order('gross_profit_12m', { ascending: gpAsc })
-    } else if (ohOrder !== 'none') {
-      // For on-hand sorting in fallback, we'll need to sort after fetching inventory data
-      cacheQ = cacheQ.order('product_id', { ascending: true })
-    } else {
-      cacheQ = cacheQ.order('product_id', { ascending: true })
-    }
-    
-    cacheQ = cacheQ.range(from, to)
-
-    const cacheRes = await cacheQ
-    if (cacheRes.error) return res.status(500).json({ error: cacheRes.error.message })
-
-    const ids = (cacheRes.data ?? []).map(r => String(r.product_id))
-    let names = new Map<string, string>()
-    let inventory = new Map<string, number>()
-    
-    if (ids.length) {
-      // Get names
-      const namesRes = await supabaseService.from('products').select('id,name').in('id', ids)
-      if (namesRes.error) return res.status(500).json({ error: namesRes.error.message })
-      for (const p of namesRes.data ?? []) names.set(String(p.id), String(p.name ?? ''))
-      
-      // Get inventory data
-      const invRes = await supabaseService
-        .from('inventory_current')
-        .select('product_id,on_hand')
-        .in('product_id', ids)
-      if (!invRes.error) {
-        for (const inv of invRes.data ?? []) {
-          inventory.set(String(inv.product_id), Number(inv.on_hand ?? 0))
-        }
-      }
-    }
-
-    const total = cacheRes.count ?? (cacheRes.data?.length ?? 0)
-    let items = (cacheRes.data ?? []).map((r: any) => ({
+    const total = viewRes.count ?? (viewRes.data?.length ?? 0)
+    const items = (viewRes.data ?? []).map((r: any) => ({
       id: String(r.product_id),
-      name: (names.get(String(r.product_id)) || '').trim() || '(unknown product)',
+      name: String(r.product_name ?? '').trim() || '(unknown product)',
       qty_12m: Number(r.qty_12m ?? 0),
       revenue_12m: Number(r.revenue_12m ?? 0),
       gross_profit_12m: Number(r.gross_profit_12m ?? 0),
-      on_hand: inventory.get(String(r.product_id)) ?? 0,
+      on_hand: Number(r.inventory_current?.on_hand ?? 0),
     }))
-    
-    // If on-hand sorting is active in fallback, sort the results
-    if (ohOrder !== 'none') {
-      const ohAsc = ohOrder === 'asc'
-      items.sort((a, b) => ohAsc ? a.on_hand - b.on_hand : b.on_hand - a.on_hand)
-    }
 
     return res.json({
       page,
@@ -283,7 +218,7 @@ router.get('/products/:id/overview', async (req, res) => {
     }
     const aspWeighted = totalQty > 0 ? totalRevenue / totalQty : 0
 
-    // Current unit cost/price (use view if present, else 0)
+    // Current unit cost/price
     const priceNow = await supabaseService
       .from('v_product_current_price')
       .select('unit_cost, unit_price, effective_date')
@@ -337,7 +272,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const sigma12 = stddev(buckets12.map(r => r.qty))
     const weighted_moq = Math.ceil(weightedAvg12 * ORDER_COVERAGE_MONTHS)
 
-    // Inventory now (for On hand KPI) — robust numeric conversion
+    // Inventory now
     const inv = await supabaseService
       .from('inventory_current')
       .select('on_hand, backorder')
@@ -347,7 +282,7 @@ router.get('/products/:id/overview', async (req, res) => {
     const on_hand = Number(inv.data?.on_hand ?? 0)
     const backorder = Number(inv.data?.backorder ?? 0)
 
-    // Seasonality & legacy top customers
+    // Seasonality & top customers
     const seas = await supabaseService.rpc('product_seasonality_last12', { p_product_id: productId })
     if (seas.error) return res.status(500).json({ error: seas.error.message })
 
@@ -424,6 +359,5 @@ router.get('/products/:id/overview', async (req, res) => {
     return res.status(500).json({ error: e?.message || 'Server error' })
   }
 })
-
 
 export default router
