@@ -70,37 +70,36 @@ router.get('/dashboard/overview', async (req, res) => {
     }
 
       // Revenue = sum of revenue_12m from product_kpis_12m (handle pagination to get all rows)
-      let sales_12m_revenue = 0
+    let sales_12m_revenue = 0
       let totalRowsProcessed = 0
-      {
+    {
         const PAGE = 1000
-        let offset = 0
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
+      let offset = 0
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
           const revQ = await supabaseService
             .from('product_kpis_12m')
             .select('revenue_12m')
-            .range(offset, offset + PAGE - 1)
-          
+          .range(offset, offset + PAGE - 1)
+
           if (revQ.error) {
             console.error('[dashboard] revenue from product_kpis_12m error:', revQ.error)
             return res.status(500).json({ error: revQ.error.message })
           }
           
           const rows = revQ.data ?? []
-          if (rows.length === 0) break
-          
+        if (rows.length === 0) break
+
           // Sum revenue from this batch
           const batchRevenue = rows.reduce((s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0)
           sales_12m_revenue += batchRevenue
           totalRowsProcessed += rows.length
           
-          if (rows.length < PAGE) break
-          offset += PAGE
-        }
-        
-        console.log(`[dashboard] Revenue calculation: processed ${totalRowsProcessed} rows, total revenue: ${sales_12m_revenue}`)
+        if (rows.length < PAGE) break
+        offset += PAGE
       }
+        
+    }
 
     // 3) Per-product monthly aggregation (for MOQ calc identical to products.ts)
     const perProdMonthly = new Map<string, number[]>() // pid -> [12]
@@ -175,56 +174,70 @@ router.get('/dashboard/overview', async (req, res) => {
       }
     }
 
-    // 5) At-Risk list using manual calculation (since your view doesn't have weighted_moq_4m)
-    type AtRiskRow = { product_id: string; on_hand: number; weighted_moq: number; gap: number }
-    const atRiskAll: AtRiskRow[] = []
-    
-    const pidSet = new Set<string>([
-      ...Array.from(perProdMonthly.keys()),
-      ...Array.from(onHandMap.keys()),
-    ])
+    // 5) At-Risk products section
+    let atRiskProducts: any[] = []
+    {
+      try {
+        // Get all products with names first
+        const { data: allProducts, error: productsError } = await supabaseService
+          .from('products')
+          .select('id,name')
+          .order('name', { ascending: true })
 
-    for (const pid of pidSet) {
-      if (!isUUID(pid)) continue
-      const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
-      const weightedSum = arr.reduce((sum, q, i) => sum + q * (i + 1), 0)
-      const weightedAvg12 = wSum12 ? (weightedSum / wSum12) : 0
-      const weighted_moq = Math.ceil(weightedAvg12 * ORDER_COVERAGE_MONTHS)
+        if (productsError) {
+          console.warn('[at-risk] Products query error:', productsError.message)
+        } else if (allProducts && allProducts.length > 0) {
+          // Build at-risk products for ALL products, not just those with sales data
+          atRiskProducts = await Promise.all(allProducts.map(async (product) => {
+            // Get sales data if available, otherwise use zeros
+            const monthlyData = perProdMonthly.get(product.id) || Array(12).fill(0)
+            
+            // Calculate weighted average from the 12 months of data
+            const weights = Array.from({ length: 12 }, (_, i) => i + 1)
+            const wSum = weights.reduce((a, b) => a + b, 0)
+            const weightedSum = monthlyData.reduce((acc, qty, i) => acc + qty * weights[i], 0)
+            const weightedAvg = wSum ? weightedSum / wSum : 0
+            const weighted_moq = Math.ceil(weightedAvg * ORDER_COVERAGE_MONTHS)
+            
+            // Get on-hand from inventory_current using the same method as individual product pages
+            let on_hand = 0
+            try {
+              const inv = await supabaseService
+                .from('inventory_current')
+                .select('on_hand, backorder')
+                .eq('product_id', product.id)
+                .maybeSingle()
+              
+              if (!inv.error && inv.data) {
+                on_hand = Number(inv.data.on_hand ?? 0)
+              }
+            } catch (e) {
+              console.warn(`[dashboard] Error fetching inventory for product ${product.id}:`, e)
+            }
+            
+            const gap = Math.max(0, weighted_moq - on_hand)
 
-      const on_hand = onHandMap.get(pid) ?? 0
-      const gap = Math.max(0, weighted_moq - on_hand)
+            return {
+              product_id: product.id,
+              product_name: product.name || `Product ${product.id.slice(0, 8)}...`,
+              on_hand,
+              weighted_moq,
+              gap
+            }
+          }))
 
-      if (gap > 0) atRiskAll.push({ product_id: pid, on_hand, weighted_moq, gap })
-    }
-
-    atRiskAll.sort((a, b) => b.gap - a.gap)
-    const totalAtRisk = atRiskAll.length
-    const pageSlice = atRiskAll.slice(from, to)
-
-    // 6) Names for the current page
-    const atRiskIds = pageSlice.map(r => r.product_id).filter(isUUID)
-    const nameMap = new Map<string, string>()
-    if (atRiskIds.length > 0) {
-      for (const part of chunk(atRiskIds, 200)) {
-        const nQ = await supabaseService.from('products').select('id,name').in('id', part)
-        if (nQ.error) return res.status(500).json({ error: nQ.error.message })
-        for (const p of (nQ.data ?? []) as any[]) {
-          nameMap.set(String(p.id), String(p.name ?? ''))
+          // Sort by gap (highest first) - show ALL products, not just top 20
+          atRiskProducts.sort((a, b) => b.gap - a.gap)
         }
+        
+      } catch (e: any) {
+        console.error('[at-risk] Error:', e)
+        // Fallback: return empty array if there's an error
+        atRiskProducts = []
       }
     }
 
-    const atRiskPage = pageSlice.map(r => ({
-      product_id: r.product_id,
-      product_name: (nameMap.get(r.product_id) || '').trim() || '(unknown product)',
-      on_hand: r.on_hand,
-      weighted_moq: r.weighted_moq,
-      gap: r.gap,
-      // If you want to show backorders later, you already have them in backorderMap
-      // backorder: backorderMap.get(r.product_id) ?? 0,
-    }))
-
-    // 7) Response
+    // 6) Response
     return res.json({
       totals: {
         products: productsCount,
@@ -232,14 +245,7 @@ router.get('/dashboard/overview', async (req, res) => {
         sales_12m_qty,
         sales_12m_revenue,
       },
-      atRisk: {
-        page,
-        pageSize,
-        total: totalAtRisk,
-        pages: Math.max(1, Math.ceil(totalAtRisk / pageSize)),
-        items: atRiskPage,
-      },
-      topProducts: [],
+      atRisk: atRiskProducts
     })
   } catch (e: any) {
     console.error('GET /dashboard/overview error:', e)
