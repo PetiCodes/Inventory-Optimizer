@@ -3,6 +3,12 @@ import { supabaseService } from '../src/supabase.js'
 
 const router = Router()
 
+/* ------------------------------ Utilities ------------------------------ */
+function toInt(v: any, d: number) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : d
+}
+
 /* -------------------- date helpers (UTC, month-aligned) -------------------- */
 function monthStartUTC(y: number, m0: number) {
   return new Date(Date.UTC(y, m0, 1))
@@ -58,25 +64,54 @@ router.get('/products/search', async (req, res) => {
   }
 })
 
-/* ----------------------- PAGINATED GP-RANKED LIST ----------------------- */
+/* ----------------------- PAGINATED PRODUCTS LIST ----------------------- */
 router.get('/products/list', async (req, res) => {
   try {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const limit = Math.max(1, Math.min(Number(req.query.limit ?? 20), 200))
-    const orderParam = String(req.query.order ?? 'gp_desc')
-    const ascending = orderParam === 'gp_asc'
+    const gpOrder = String(req.query.gp_order ?? 'none') // 'none', 'desc', 'asc'
+    const ohOrder = String(req.query.oh_order ?? 'none') // 'none', 'desc', 'asc'
     const q = String(req.query.q ?? '').trim()
 
     const from = (page - 1) * limit
     const to = from + limit - 1
 
-    // Preferred: view (already has product_name)
+    // Get products with inventory data for on-hand sorting
     let builder = supabaseService
       .from('v_product_profit_cache')
-      .select('product_id, product_name, qty_12m, revenue_12m, gross_profit_12m', { count: 'exact' })
+      .select(`
+        product_id, 
+        product_name, 
+        qty_12m, 
+        revenue_12m, 
+        gross_profit_12m,
+        inventory_current!inner(on_hand)
+      `, { count: 'exact' })
 
     if (q) builder = builder.ilike('product_name', `%${q}%`)
-    builder = builder.order('gross_profit_12m', { ascending }).range(from, to)
+
+    // Apply sorting based on active filters
+    if (gpOrder !== 'none' && ohOrder !== 'none') {
+      // Both filters active: primary sort by gross profit, secondary by on-hand
+      const gpAsc = gpOrder === 'asc'
+      const ohAsc = ohOrder === 'asc'
+      builder = builder
+        .order('gross_profit_12m', { ascending: gpAsc })
+        .order('inventory_current.on_hand', { ascending: ohAsc })
+    } else if (gpOrder !== 'none') {
+      // Only gross profit filter active
+      const gpAsc = gpOrder === 'asc'
+      builder = builder.order('gross_profit_12m', { ascending: gpAsc })
+    } else if (ohOrder !== 'none') {
+      // Only on-hand filter active
+      const ohAsc = ohOrder === 'asc'
+      builder = builder.order('inventory_current.on_hand', { ascending: ohAsc })
+    } else {
+      // Default: alphabetical by product name
+      builder = builder.order('product_name', { ascending: true })
+    }
+
+    builder = builder.range(from, to)
 
     const viewRes = await builder
 
@@ -88,6 +123,7 @@ router.get('/products/list', async (req, res) => {
         qty_12m: Number(r.qty_12m ?? 0),
         revenue_12m: Number(r.revenue_12m ?? 0),
         gross_profit_12m: Number(r.gross_profit_12m ?? 0),
+        on_hand: Number(r.inventory_current?.on_hand ?? 0),
       }))
       return res.json({
         page,
@@ -98,7 +134,7 @@ router.get('/products/list', async (req, res) => {
       })
     }
 
-    // Fallback: table + names
+    // Fallback: table + names + inventory
     let idFilter: string[] | null = null
     if (q) {
       const nameRes = await supabaseService
@@ -112,31 +148,68 @@ router.get('/products/list', async (req, res) => {
       }
     }
 
+    // Get profit data
     let cacheQ = supabaseService
       .from('product_profit_cache')
       .select('product_id, qty_12m, revenue_12m, gross_profit_12m', { count: 'exact' })
     if (idFilter) cacheQ = cacheQ.in('product_id', idFilter)
-    cacheQ = cacheQ.order('gross_profit_12m', { ascending }).range(from, to)
+    
+    // Apply sorting for fallback
+    if (gpOrder !== 'none' && ohOrder !== 'none') {
+      const gpAsc = gpOrder === 'asc'
+      cacheQ = cacheQ.order('gross_profit_12m', { ascending: gpAsc })
+    } else if (gpOrder !== 'none') {
+      const gpAsc = gpOrder === 'asc'
+      cacheQ = cacheQ.order('gross_profit_12m', { ascending: gpAsc })
+    } else if (ohOrder !== 'none') {
+      // For on-hand sorting in fallback, we'll need to sort after fetching inventory data
+      cacheQ = cacheQ.order('product_id', { ascending: true })
+    } else {
+      cacheQ = cacheQ.order('product_id', { ascending: true })
+    }
+    
+    cacheQ = cacheQ.range(from, to)
 
     const cacheRes = await cacheQ
     if (cacheRes.error) return res.status(500).json({ error: cacheRes.error.message })
 
     const ids = (cacheRes.data ?? []).map(r => String(r.product_id))
     let names = new Map<string, string>()
+    let inventory = new Map<string, number>()
+    
     if (ids.length) {
+      // Get names
       const namesRes = await supabaseService.from('products').select('id,name').in('id', ids)
       if (namesRes.error) return res.status(500).json({ error: namesRes.error.message })
       for (const p of namesRes.data ?? []) names.set(String(p.id), String(p.name ?? ''))
+      
+      // Get inventory data
+      const invRes = await supabaseService
+        .from('inventory_current')
+        .select('product_id,on_hand')
+        .in('product_id', ids)
+      if (!invRes.error) {
+        for (const inv of invRes.data ?? []) {
+          inventory.set(String(inv.product_id), Number(inv.on_hand ?? 0))
+        }
+      }
     }
 
     const total = cacheRes.count ?? (cacheRes.data?.length ?? 0)
-    const items = (cacheRes.data ?? []).map((r: any) => ({
+    let items = (cacheRes.data ?? []).map((r: any) => ({
       id: String(r.product_id),
       name: (names.get(String(r.product_id)) || '').trim() || '(unknown product)',
       qty_12m: Number(r.qty_12m ?? 0),
       revenue_12m: Number(r.revenue_12m ?? 0),
       gross_profit_12m: Number(r.gross_profit_12m ?? 0),
+      on_hand: inventory.get(String(r.product_id)) ?? 0,
     }))
+    
+    // If on-hand sorting is active in fallback, sort the results
+    if (ohOrder !== 'none') {
+      const ohAsc = ohOrder === 'asc'
+      items.sort((a, b) => ohAsc ? a.on_hand - b.on_hand : b.on_hand - a.on_hand)
+    }
 
     return res.json({
       page,
@@ -351,5 +424,6 @@ router.get('/products/:id/overview', async (req, res) => {
     return res.status(500).json({ error: e?.message || 'Server error' })
   }
 })
+
 
 export default router
