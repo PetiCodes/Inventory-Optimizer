@@ -55,9 +55,10 @@ router.get('/dashboard/overview', async (req, res) => {
     if (custHead.error) return res.status(500).json({ error: custHead.error.message })
     const customersCount = custHead.count ?? 0
 
-    // 2) KPIs
-    // Qty (12m): most recent 12 rows of v_sales_monthly_total
+    // 2) KPIs - Use correct views for each metric
     let sales_12m_qty = 0
+    
+    // Sales Qty (12m): Keep original logic using v_sales_monthly_total
     {
       const qtyQ = await supabaseService
         .from('v_sales_monthly_total')
@@ -68,41 +69,44 @@ router.get('/dashboard/overview', async (req, res) => {
       sales_12m_qty = (qtyQ.data ?? []).reduce((s: number, r: any) => s + Number(r.total_qty ?? 0), 0)
     }
 
-    // Revenue (12m): from raw sales, over the same 12-month window
-    const s12 = lastNMonthsScaffold(12)
-    const startISO = monthStartUTC(s12[0].y, s12[0].m0).toISOString().slice(0, 10)
-    const endISO = monthEndUTC(s12[s12.length - 1].y, s12[s12.length - 1].m0).toISOString().slice(0, 10)
-
-    let sales_12m_revenue = 0
-    {
-      const PAGE = 2000
-      let offset = 0
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        const q = await supabaseService
-          .from('sales')
-          .select('quantity,unit_price')
-          .gte('date', startISO)
-          .lte('date', endISO)
-          .range(offset, offset + PAGE - 1)
-
-        if (q.error) return res.status(500).json({ error: q.error.message })
-        const rows = (q.data ?? []) as SaleRow[]
-        if (rows.length === 0) break
-
-        for (const r of rows) {
-          const qty = Number(r.quantity ?? 0)
-          const price = Number(r.unit_price ?? 0)
-          sales_12m_revenue += qty * price
+      // Revenue = sum of revenue_12m from product_kpis_12m (handle pagination to get all rows)
+      let sales_12m_revenue = 0
+      let totalRowsProcessed = 0
+      {
+        const PAGE = 1000
+        let offset = 0
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const revQ = await supabaseService
+            .from('product_kpis_12m')
+            .select('revenue_12m')
+            .range(offset, offset + PAGE - 1)
+          
+          if (revQ.error) {
+            console.error('[dashboard] revenue from product_kpis_12m error:', revQ.error)
+            return res.status(500).json({ error: revQ.error.message })
+          }
+          
+          const rows = revQ.data ?? []
+          if (rows.length === 0) break
+          
+          // Sum revenue from this batch
+          const batchRevenue = rows.reduce((s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0)
+          sales_12m_revenue += batchRevenue
+          totalRowsProcessed += rows.length
+          
+          if (rows.length < PAGE) break
+          offset += PAGE
         }
-        if (rows.length < PAGE) break
-        offset += PAGE
+        
+        console.log(`[dashboard] Revenue calculation: processed ${totalRowsProcessed} rows, total revenue: ${sales_12m_revenue}`)
       }
-    }
 
     // 3) Per-product monthly aggregation (for MOQ calc identical to products.ts)
     const perProdMonthly = new Map<string, number[]>() // pid -> [12]
     {
+      // Define s12 for the monthly aggregation
+      const s12 = lastNMonthsScaffold(12)
       const PAGE = 1000
       for (let i = 0; i < 12; i++) {
         const mStart = monthStartUTC(s12[i].y, s12[i].m0).toISOString().slice(0, 10)
@@ -149,29 +153,37 @@ router.get('/dashboard/overview', async (req, res) => {
           .select('product_id,on_hand,backorder')
           .range(offset, offset + PAGE - 1)
 
-        if (inv.error) return res.status(500).json({ error: inv.error.message })
+        if (inv.error) {
+          console.warn('inventory_current table error:', inv.error.message)
+          // If inventory_current doesn't exist or has issues, continue with empty map
+          break
+        }
         const rows = inv.data ?? []
         if (rows.length === 0) break
 
         for (const r of rows as any[]) {
           const pid = String(r.product_id)
           if (!isUUID(pid)) continue
-          onHandMap.set(pid, Number(r.on_hand ?? 0))       // ← same defaulting as products.ts
-          backorderMap.set(pid, Number(r.backorder ?? 0))  // ← capture backorder too (optional)
+          // Ensure we're getting numeric values and handle null/undefined properly
+          const onHand = Number(r.on_hand ?? 0)
+          const backorder = Number(r.backorder ?? 0)
+          onHandMap.set(pid, onHand)
+          backorderMap.set(pid, backorder)
         }
         if (rows.length < PAGE) break
         offset += PAGE
       }
     }
 
-    // 5) At-Risk list using the same MOQ formula as products.ts
+    // 5) At-Risk list using manual calculation (since your view doesn't have weighted_moq_4m)
     type AtRiskRow = { product_id: string; on_hand: number; weighted_moq: number; gap: number }
+    const atRiskAll: AtRiskRow[] = []
+    
     const pidSet = new Set<string>([
       ...Array.from(perProdMonthly.keys()),
-      ...Array.from(onHandMap.keys()), // include items with stock but no recent sales
+      ...Array.from(onHandMap.keys()),
     ])
 
-    const atRiskAll: AtRiskRow[] = []
     for (const pid of pidSet) {
       if (!isUUID(pid)) continue
       const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
@@ -179,7 +191,6 @@ router.get('/dashboard/overview', async (req, res) => {
       const weightedAvg12 = wSum12 ? (weightedSum / wSum12) : 0
       const weighted_moq = Math.ceil(weightedAvg12 * ORDER_COVERAGE_MONTHS)
 
-      // “same logic as products.ts”: default to 0 if there is no inventory row
       const on_hand = onHandMap.get(pid) ?? 0
       const gap = Math.max(0, weighted_moq - on_hand)
 
