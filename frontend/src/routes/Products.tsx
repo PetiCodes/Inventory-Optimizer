@@ -15,6 +15,7 @@ type Row = {
   qty_12m: number
   revenue_12m: number
   gross_profit_12m: number
+  on_hand: number
 }
 
 const fmtCurrency = (n: number) =>
@@ -37,7 +38,8 @@ export default function Products() {
   // paging & order
   const [page, setPage] = useState(1)
   const [limit] = useState(20)
-  const [order, setOrder] = useState<'gp_desc' | 'gp_asc'>('gp_desc')
+  const [gpOrder, setGpOrder] = useState<'none' | 'desc' | 'asc'>('none')
+  const [ohOrder, setOhOrder] = useState<'none' | 'desc' | 'asc'>('none')
 
   // data state
   const [items, setItems] = useState<Row[]>([])
@@ -50,7 +52,7 @@ export default function Products() {
   useEffect(() => {
     fetchPage()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, page, order])
+  }, [q, page, gpOrder, ohOrder])
 
   async function fetchPage() {
     setLoading(true)
@@ -60,7 +62,8 @@ export default function Products() {
       const params = new URLSearchParams()
       params.set('page', String(page))
       params.set('limit', String(limit))
-      params.set('order', order)
+      if (gpOrder !== 'none') params.set('gp_order', gpOrder)
+      if (ohOrder !== 'none') params.set('oh_order', ohOrder)
       if (q) params.set('q', q)
 
       const res = await fetch(
@@ -84,7 +87,7 @@ export default function Products() {
   }
 
   // reset to page 1 on new search/order
-  useEffect(() => { setPage(1) }, [q, order])
+  useEffect(() => { setPage(1) }, [q, gpOrder, ohOrder])
 
   const headerNote = useMemo(
     () => (loading ? 'Loading…' : `Found ${total} items`),
@@ -106,11 +109,28 @@ export default function Products() {
           </div>
           <div className="flex items-center gap-2 md:ml-2">
             <Button
-              variant="secondary"
-              onClick={() => setOrder(o => (o === 'gp_desc' ? 'gp_asc' : 'gp_desc'))}
-              title="Toggle ranking: Top ↔ Worst"
+              variant={gpOrder === 'none' ? 'primary' : 'secondary'}
+              onClick={() => {
+                if (gpOrder === 'none') setGpOrder('desc')
+                else if (gpOrder === 'desc') setGpOrder('asc')
+                else setGpOrder('none')
+              }}
+              title="Sort by Gross Profit"
             >
-              {order === 'gp_desc' ? 'Show Worst First' : 'Show Top First'}
+              {gpOrder === 'none' ? 'Gross Profit' : 
+               gpOrder === 'desc' ? 'GP: High to Low' : 'GP: Low to High'}
+            </Button>
+            <Button
+              variant={ohOrder === 'none' ? 'primary' : 'secondary'}
+              onClick={() => {
+                if (ohOrder === 'none') setOhOrder('desc')
+                else if (ohOrder === 'desc') setOhOrder('asc')
+                else setOhOrder('none')
+              }}
+              title="Sort by On-Hand Inventory"
+            >
+              {ohOrder === 'none' ? 'On-Hand' : 
+               ohOrder === 'desc' ? 'OH: High to Low' : 'OH: Low to High'}
             </Button>
           </div>
         </div>
@@ -136,6 +156,7 @@ export default function Products() {
                       <TableHead className="text-right w-[120px]">Qty (12m)</TableHead>
                       <TableHead className="text-right w-[160px]">Revenue (12m)</TableHead>
                       <TableHead className="text-right w-[160px]">Gross Profit (12m)</TableHead>
+                      <TableHead className="text-right w-[120px]">On-Hand</TableHead>
                       <TableHead className="text-right w-[120px]">Actions</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -147,6 +168,7 @@ export default function Products() {
                         <TableCell className="text-right">{fmtNumber(p.qty_12m)}</TableCell>
                         <TableCell className="text-right">{fmtCurrency(p.revenue_12m)}</TableCell>
                         <TableCell className="text-right">{fmtCurrency(p.gross_profit_12m)}</TableCell>
+                        <TableCell className="text-right">{fmtNumber(p.on_hand)}</TableCell>
                         <TableCell className="text-right">
                           <Button size="sm" onClick={() => navigate(`/products/${p.id}`)}>
                             View
@@ -156,7 +178,7 @@ export default function Products() {
                     ))}
                     {((items ?? []).length === 0 && !loading && !error) && (
                       <TableRow>
-                        <TableCell colSpan={6} className="text-center text-gray-500">
+                        <TableCell colSpan={7} className="text-center text-gray-500">
                           No products found.
                         </TableCell>
                       </TableRow>
