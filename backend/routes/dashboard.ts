@@ -70,36 +70,33 @@ router.get('/dashboard/overview', async (req, res) => {
     }
 
       // Revenue = sum of revenue_12m from product_kpis_12m (handle pagination to get all rows)
-    let sales_12m_revenue = 0
-      let totalRowsProcessed = 0
-    {
+      let sales_12m_revenue = 0
+      {
         const PAGE = 1000
-      let offset = 0
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
+        let offset = 0
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
           const revQ = await supabaseService
             .from('product_kpis_12m')
             .select('revenue_12m')
-          .range(offset, offset + PAGE - 1)
-
+            .range(offset, offset + PAGE - 1)
+          
           if (revQ.error) {
             console.error('[dashboard] revenue from product_kpis_12m error:', revQ.error)
             return res.status(500).json({ error: revQ.error.message })
           }
           
           const rows = revQ.data ?? []
-        if (rows.length === 0) break
-
+          if (rows.length === 0) break
+          
           // Sum revenue from this batch
           const batchRevenue = rows.reduce((s: number, r: any) => s + Number(r.revenue_12m ?? 0), 0)
           sales_12m_revenue += batchRevenue
-          totalRowsProcessed += rows.length
           
-        if (rows.length < PAGE) break
-        offset += PAGE
+          if (rows.length < PAGE) break
+          offset += PAGE
+        }
       }
-        
-    }
 
     // 3) Per-product monthly aggregation (for MOQ calc identical to products.ts)
     const perProdMonthly = new Map<string, number[]>() // pid -> [12]
@@ -138,41 +135,9 @@ router.get('/dashboard/overview', async (req, res) => {
       }
     }
 
-    // 4) On hand + backorder (apply the same logic as products.ts, but in bulk)
-    // products.ts does maybeSingle() and defaults to 0 if missing; here we page through all rows
+    // 4) On hand + backorder - we'll fetch this per product in the at-risk section for accuracy
     const onHandMap = new Map<string, number>()
     const backorderMap = new Map<string, number>()
-    {
-      const PAGE = 2000
-      let offset = 0
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        const inv = await supabaseService
-          .from('inventory_current')
-          .select('product_id,on_hand,backorder')
-          .range(offset, offset + PAGE - 1)
-
-        if (inv.error) {
-          console.warn('inventory_current table error:', inv.error.message)
-          // If inventory_current doesn't exist or has issues, continue with empty map
-          break
-        }
-        const rows = inv.data ?? []
-        if (rows.length === 0) break
-
-        for (const r of rows as any[]) {
-          const pid = String(r.product_id)
-          if (!isUUID(pid)) continue
-          // Ensure we're getting numeric values and handle null/undefined properly
-          const onHand = Number(r.on_hand ?? 0)
-          const backorder = Number(r.backorder ?? 0)
-          onHandMap.set(pid, onHand)
-          backorderMap.set(pid, backorder)
-        }
-        if (rows.length < PAGE) break
-        offset += PAGE
-      }
-    }
 
     // 5) At-Risk products section
     let atRiskProducts: any[] = []
@@ -187,44 +152,56 @@ router.get('/dashboard/overview', async (req, res) => {
         if (productsError) {
           console.warn('[at-risk] Products query error:', productsError.message)
         } else if (allProducts && allProducts.length > 0) {
-          // Build at-risk products for ALL products, not just those with sales data
-          atRiskProducts = await Promise.all(allProducts.map(async (product) => {
-            // Get sales data if available, otherwise use zeros
-            const monthlyData = perProdMonthly.get(product.id) || Array(12).fill(0)
-            
-            // Calculate weighted average from the 12 months of data
-            const weights = Array.from({ length: 12 }, (_, i) => i + 1)
-            const wSum = weights.reduce((a, b) => a + b, 0)
-            const weightedSum = monthlyData.reduce((acc, qty, i) => acc + qty * weights[i], 0)
-            const weightedAvg = wSum ? weightedSum / wSum : 0
-            const weighted_moq = Math.ceil(weightedAvg * ORDER_COVERAGE_MONTHS)
-            
-            // Get on-hand from inventory_current using the same method as individual product pages
-            let on_hand = 0
-            try {
-              const inv = await supabaseService
-                .from('inventory_current')
-                .select('on_hand, backorder')
-                .eq('product_id', product.id)
-                .maybeSingle()
-              
-              if (!inv.error && inv.data) {
-                on_hand = Number(inv.data.on_hand ?? 0)
-              }
-            } catch (e) {
-              console.warn(`[dashboard] Error fetching inventory for product ${product.id}:`, e)
-            }
-            
-            const gap = Math.max(0, weighted_moq - on_hand)
+          // Process products in batches to balance performance and accuracy
+          const BATCH_SIZE = 100
+          const productBatches = []
+          for (let i = 0; i < allProducts.length; i += BATCH_SIZE) {
+            productBatches.push(allProducts.slice(i, i + BATCH_SIZE))
+          }
 
-            return {
-              product_id: product.id,
-              product_name: product.name || `Product ${product.id.slice(0, 8)}...`,
-              on_hand,
-              weighted_moq,
-              gap
-            }
-          }))
+          atRiskProducts = []
+          
+          for (const batch of productBatches) {
+            const batchResults = await Promise.all(batch.map(async (product) => {
+              // Get sales data if available, otherwise use zeros
+              const monthlyData = perProdMonthly.get(product.id) || Array(12).fill(0)
+              
+              // Calculate weighted average from the 12 months of data
+              const weights = Array.from({ length: 12 }, (_, i) => i + 1)
+              const wSum = weights.reduce((a, b) => a + b, 0)
+              const weightedSum = monthlyData.reduce((acc, qty, i) => acc + qty * weights[i], 0)
+              const weightedAvg = wSum ? weightedSum / wSum : 0
+              const weighted_moq = Math.ceil(weightedAvg * ORDER_COVERAGE_MONTHS)
+              
+              // Get on-hand from inventory_current using the same method as individual product pages
+              let on_hand = 0
+              try {
+                const inv = await supabaseService
+                  .from('inventory_current')
+                  .select('on_hand, backorder')
+                  .eq('product_id', product.id)
+                  .maybeSingle()
+                
+                if (!inv.error && inv.data) {
+                  on_hand = Number(inv.data.on_hand ?? 0)
+                }
+              } catch (e) {
+                // Silent fail for individual products
+              }
+              
+              const gap = Math.max(0, weighted_moq - on_hand)
+
+              return {
+                product_id: product.id,
+                product_name: product.name || `Product ${product.id.slice(0, 8)}...`,
+                on_hand,
+                weighted_moq,
+                gap
+              }
+            }))
+            
+            atRiskProducts.push(...batchResults)
+          }
 
           // Sort by gap (highest first) - show ALL products, not just top 20
           atRiskProducts.sort((a, b) => b.gap - a.gap)
