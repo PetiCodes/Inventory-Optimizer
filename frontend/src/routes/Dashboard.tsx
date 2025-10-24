@@ -21,14 +21,7 @@ type AtRiskItem = {
   weighted_moq: number
   gap: number
 }
-type AtRiskPage = {
-  page: number
-  pageSize: number
-  total: number
-  pages: number
-  items: AtRiskItem[]
-}
-type ApiResp = { totals: Totals; atRisk: AtRiskPage; topProducts?: any[] }
+type ApiResp = { totals: Totals; atRisk: AtRiskItem[]; topProducts?: any[] }
 
 export default function Dashboard() {
   const navigate = useNavigate()
@@ -41,23 +34,28 @@ export default function Dashboard() {
   const [page, setPage] = useState(1)
   const [pageSize] = useState(20)
 
+
+
   async function load() {
     setLoading(true)
     setError(null)
     try {
       const token = (await supabase.auth.getSession()).data.session?.access_token
       if (!token) throw new Error('Not authenticated')
-      const params = new URLSearchParams()
-      params.set('page', String(page))
-      params.set('pageSize', String(pageSize))
-
-      const res = await fetch(
-        `${(import.meta as any).env.VITE_API_BASE}/api/dashboard/overview?` + params.toString(),
+      
+      // Load dashboard totals
+      const totalsRes = await fetch(
+        `${(import.meta as any).env.VITE_API_BASE}/api/dashboard/overview`,
         { headers: { Authorization: `Bearer ${token}` } }
       )
-      const json: ApiResp | { error?: string } = await res.json()
-      if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`)
-      setData(json as ApiResp)
+      const totalsJson: { totals: Totals } | { error?: string } = await totalsRes.json()
+      if (!totalsRes.ok) throw new Error((totalsJson as any)?.error || `HTTP ${totalsRes.status}`)
+
+  setData({
+    totals: (totalsJson as any).totals,
+    atRisk: (totalsJson as any).atRisk || [],
+    topProducts: []
+  })
     } catch (e: any) {
       setError(e.message || 'Failed to load dashboard')
       setData(null)
@@ -72,8 +70,17 @@ export default function Dashboard() {
   const money = (v: number) =>
     v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
-  const canPrev = (data?.atRisk?.page ?? 1) > 1
-  const canNext = (data?.atRisk?.page ?? 1) < (data?.atRisk?.pages ?? 1)
+  // Pagination for at-risk products
+  const totalPages = useMemo(() => Math.max(1, Math.ceil((data?.atRisk?.length ?? 0) / pageSize)), [data?.atRisk?.length, pageSize])
+  const canPrev = page > 1
+  const canNext = page < totalPages
+  const paginatedAtRisk = useMemo(() => {
+    if (!data?.atRisk) return []
+    const start = (page - 1) * pageSize
+    const end = start + pageSize
+    return data.atRisk.slice(start, end)
+  }, [data?.atRisk, page, pageSize])
+
 
   return (
     <AppShell>
@@ -126,22 +133,35 @@ export default function Dashboard() {
               </Card>
             </div>
 
-            {/* At-Risk — paginated like other pages */}
+            {/* At-Risk — paginated like customers page */}
             <Card>
               <CardHeader>
                 <div className="flex items-center justify-between">
                   <div>
                     <h3 className="text-base font-semibold text-gray-900">At-Risk of Stockout</h3>
-                    <p className="text-xs text-gray-600">
-                      Page {data.atRisk.page} of {data.atRisk.pages} &middot; {fmt.format(data.atRisk.total)} total
-                    </p>
+                    <div className="text-sm text-gray-600">
+                      {loading ? 'Loading…' : `Showing ${paginatedAtRisk.length} of ${data.atRisk.length} products`}
+                    </div>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Button size="sm" variant="secondary" disabled={!canPrev} onClick={() => setPage(p => Math.max(1, p - 1))}>
-                      Prev
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={!canPrev || loading}
+                      onClick={() => setPage(p => Math.max(1, p - 1))}
+                    >
+                      ← Prev
                     </Button>
-                    <Button size="sm" variant="secondary" disabled={!canNext} onClick={() => setPage(p => p + 1)}>
-                      Next
+                    <span className="text-sm text-gray-700">
+                      Page {page} / {totalPages}
+                    </span>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={!canNext || loading}
+                      onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                    >
+                      Next →
                     </Button>
                   </div>
                 </div>
@@ -151,18 +171,18 @@ export default function Dashboard() {
                   <Table>
                     <TableHeader>
                       <TableRow>
-                        <TableHead className="w-10">#</TableHead>
+                        <TableHead className="w-[64px]">#</TableHead>
                         <TableHead className="max-w-[280px]">Product</TableHead>
                         <TableHead className="text-right w-20">On&nbsp;Hand</TableHead>
                         <TableHead className="text-right w-24">MOQ</TableHead>
                         <TableHead className="text-right w-16">Gap</TableHead>
-                        <TableHead className="text-right w-24">Actions</TableHead>
+                        <TableHead className="text-right w-[140px]">Actions</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {(data.atRisk.items ?? []).map((r, i) => (
+                      {paginatedAtRisk.map((r, i) => (
                         <TableRow key={r.product_id}>
-                          <TableCell>{(data.atRisk.page - 1) * data.atRisk.pageSize + i + 1}</TableCell>
+                          <TableCell>{(page - 1) * pageSize + i + 1}</TableCell>
                           <TableCell className="font-medium whitespace-normal break-words">
                             <div className="text-[13px] leading-tight line-clamp-2">
                               {r.product_name}
@@ -184,9 +204,11 @@ export default function Dashboard() {
                           </TableCell>
                         </TableRow>
                       ))}
-                      {(data.atRisk.items ?? []).length === 0 && (
+                      {paginatedAtRisk.length === 0 && !loading && !error && (
                         <TableRow>
-                          <TableCell colSpan={6} className="text-center text-gray-500">No at-risk items.</TableCell>
+                          <TableCell colSpan={6} className="text-center text-gray-500">
+                            No at-risk products found.
+                          </TableCell>
                         </TableRow>
                       )}
                     </TableBody>
