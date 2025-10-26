@@ -152,7 +152,11 @@ export default function DataUpload() {
       } else {
         const inserted = data.inserted ?? 0
         const rejected = data.rejectedCount ?? 0
-        addToast(`Imported ${inserted} sales rows. Rejected ${rejected}.`, 'success')
+        const totalProcessed = data.totalRowsProcessed ?? 0
+        const message = rejected > 0 
+          ? `Imported ${inserted} of ${totalProcessed} rows. ${rejected} rejected (see details below).`
+          : `Successfully imported ${inserted} sales rows.`
+        addToast(message, rejected > 0 ? 'warning' : 'success')
       }
     } catch (e: any) {
       addToast(e.message || 'Sales upload failed', 'error')
@@ -314,6 +318,8 @@ export default function DataUpload() {
             <p className="text-sm text-gray-600">
               Expected headers:&nbsp;
               <code>Date, Customer Name, Product, Quantity, Price</code>
+              <br />
+              <span className="text-xs">Note: All rows must include Date and Customer Name (no auto-fill)</span>
             </p>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -377,18 +383,45 @@ export default function DataUpload() {
             </Button>
           </CardFooter>
 
-          {salesSummary?.reasonCounts && (
+          {salesSummary?.reasonCounts && Object.keys(salesSummary.reasonCounts).length > 0 && (
             <div className="px-6 pb-6">
               <Alert variant="warning">
-                <div className="font-semibold mb-2">Rejected rows breakdown</div>
-                <ul className="list-disc ml-6 space-y-1">
+                <div className="font-semibold mb-3">Rejected rows breakdown</div>
+                <div className="text-sm mb-3">
+                  <strong>Total rejected: {salesSummary.rejectedCount || 0}</strong>
+                </div>
+                <div className="font-semibold mb-2">By reason:</div>
+                <ul className="list-disc ml-6 space-y-1 mb-4">
                   {Object.entries(salesSummary.reasonCounts).map(([k, v]) => (
                     <li key={k}>{k}: {v as number}</li>
                   ))}
                 </ul>
-                {salesSummary.sampleRejected?.length > 0 && (
-                  <div className="mt-2 text-sm text-gray-700">
-                    Showing first {salesSummary.sampleRejected.length} rejected rows with reasons.
+                {salesSummary.sampleRejected && salesSummary.sampleRejected.length > 0 && (
+                  <div className="mt-3">
+                    <div className="font-semibold mb-2">Sample rejected rows:</div>
+                    <div className="max-h-40 overflow-y-auto text-xs">
+                      <table className="w-full border-collapse">
+                        <thead>
+                          <tr className="border-b">
+                            <th className="text-left p-1">Row</th>
+                            <th className="text-left p-1">Reason</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {salesSummary.sampleRejected.slice(0, 20).map((item: any, idx: number) => (
+                            <tr key={idx} className="border-b">
+                              <td className="p-1">{item.row}</td>
+                              <td className="p-1">{item.reason}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    {salesSummary.sampleRejected.length > 20 && (
+                      <div className="mt-2 text-xs text-gray-600">
+                        Showing first 20 of {salesSummary.sampleRejected.length} rejected rows.
+                      </div>
+                    )}
                   </div>
                 )}
               </Alert>
