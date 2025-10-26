@@ -21,6 +21,18 @@ function chunk<T>(arr: T[], size = 250): T[][] {
   return out
 }
 const toStr = (v: any) => (v === null || v === undefined ? '' : String(v))
+const stripBOM = (s: string) => s.replace(/^\uFEFF/, '')
+const collapseSpaces = (s: string) => s.replace(/\s+/g, ' ')
+
+/** Normalize product names for matching */
+function canonName(raw: any): string {
+  const t = stripBOM(toStr(raw)).trim()
+  const normBrackets = t.replace(/^\s*[［\[]([^］\]]+)[］\]]\s*/, '[$1] ')
+  return collapseSpaces(normBrackets)
+}
+
+const stripLeadingTag = (v: any) =>
+  toStr(v).replace(/^\s*\[[^\]]+\]\s*/, '').trim()
 
 function parseQuantity(v: any): number | null {
   if (v === null || v === undefined) return null
@@ -97,6 +109,54 @@ async function selectByNames(
   return out
 }
 
+/** Fetch ALL products from database with pagination */
+async function fetchAllProducts(): Promise<Array<{ id: string; name: string }>> {
+  const pageSize = 1000
+  let from = 0
+  let all: Array<{ id: string; name: string }> = []
+  
+  while (true) {
+    const to = from + pageSize - 1
+    const r = await supabaseService.from('products').select('id,name').range(from, to)
+    if (r.error) throw r.error
+    const batch = (r.data ?? []).map((p: any) => ({ id: String(p.id), name: String(p.name) }))
+    all = all.concat(batch)
+    if (batch.length < pageSize) break
+    from += pageSize
+    await new Promise(res => setTimeout(res, 3))
+  }
+  return all
+}
+
+/** Advanced product matching with multiple strategies */
+function findBestProductMatch(productName: string, prodMap: Map<string, string>, exactProdMap: Map<string, string>, strippedProdMap: Map<string, string>): string | undefined {
+  // Try 1: Exact match
+  if (prodMap.has(productName)) return prodMap.get(productName)
+  
+  // Try 2: Normalized canonical match
+  const cName = canonName(productName)
+  if (exactProdMap.has(cName)) return exactProdMap.get(cName)
+  
+  // Try 3: Strip leading tags and match
+  const cStrip = canonName(stripLeadingTag(productName))
+  const byStrip = exactProdMap.get(cStrip) || strippedProdMap.get(cStrip)
+  if (byStrip) return byStrip
+  
+  // Try 4: Match ignoring "archived" and parentheses
+  const cleanArchived = productName.replace(/^\s*\(Archived\)\s*/i, '').trim()
+  if (cleanArchived !== productName) {
+    return findBestProductMatch(cleanArchived, prodMap, exactProdMap, strippedProdMap)
+  }
+  
+  // Try 5: Case insensitive match on normalized name
+  const lowerCName = cName.toLowerCase()
+  for (const [key, id] of exactProdMap.entries()) {
+    if (key.toLowerCase() === lowerCName) return id
+  }
+  
+  return undefined
+}
+
 /* ----------------------------- route ---------------------------- */
 
 router.post('/upload', upload.single('file'), async (req, res) => {
@@ -130,7 +190,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     if (!body.length) return res.status(400).json({ error: 'No data rows found' })
 
     // Clean rows
-    type Clean = { Date: string; Customer: string; Product: string; Quantity: number; Price: number | null }
+    type Clean = { rowNum: number; Date: string; Customer: string; Product: string; Quantity: number; Price: number | null }
     const clean: Clean[] = []
     const rejected: { row: number; reason: string }[] = []
     const reasonCounts = new Map<string, number>()
@@ -138,10 +198,6 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       rejected.push({ row, reason })
       reasonCounts.set(reason, (reasonCounts.get(reason) || 0) + 1)
     }
-
-    // Forward-fill rules
-    let lastCustomer: string | null = null
-    let lastDateISO: string | null = null
 
     body.forEach((r, i) => {
       const rowNum = i + 2
@@ -151,33 +207,28 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       const rawQty  = r[idx['quantity']]
       const rawPrice = hasPrice ? r[idx[OPTIONAL_PRICE]] : undefined
 
-      // Customer forward fill
-      let customer = toStr(rawCust).trim()
-      if (customer) lastCustomer = customer
-      else if (lastCustomer) customer = lastCustomer
-
-      // Date forward fill
+      // Parse date - all rows must have a date (no auto-fill)
       let dateISO: string | null = null
-      if (rawDate === null || rawDate === undefined || String(rawDate).trim() === '') {
-        dateISO = lastDateISO
-      } else if (isExcelSerial(rawDate)) {
-        dateISO = excelSerialToISO(Number(rawDate))
-      } else {
-        dateISO = tryParseDateString(String(rawDate))
+      if (rawDate !== null && rawDate !== undefined && String(rawDate).trim() !== '') {
+        if (isExcelSerial(rawDate)) {
+          dateISO = excelSerialToISO(Number(rawDate))
+        } else {
+          dateISO = tryParseDateString(String(rawDate))
+        }
       }
-      if (dateISO) lastDateISO = dateISO
 
+      const customer = toStr(rawCust).trim()
       const product = toStr(rawProd).trim()
       const qtyNum  = parseQuantity(rawQty)
       const priceNum = hasPrice ? parsePrice(rawPrice) : null
 
-      if (!customer)       return reject(rowNum, 'Missing Customer')
-      if (!dateISO)        return reject(rowNum, 'Invalid Date')
+      if (!customer)       return reject(rowNum, 'Missing Customer Name')
+      if (!dateISO)        return reject(rowNum, 'Missing or Invalid Date')
       if (!product)        return reject(rowNum, 'Missing Product')
       if (qtyNum === null) return reject(rowNum, 'Invalid Quantity')
       if (qtyNum < 0)      return reject(rowNum, 'Negative Quantity')
 
-      clean.push({ Date: dateISO, Customer: customer, Product: product, Quantity: qtyNum, Price: priceNum })
+      clean.push({ rowNum, Date: dateISO, Customer: customer, Product: product, Quantity: qtyNum, Price: priceNum })
     })
 
     if (!clean.length) {
@@ -193,35 +244,130 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const uniqueCustomers = Array.from(new Set(clean.map(r => r.Customer)))
     const uniqueProducts  = Array.from(new Set(clean.map(r => r.Product)))
 
+    // Create customers
     for (const part of chunk(uniqueCustomers, 200)) {
       const up1 = await supabaseService
         .from('customers')
         .upsert(part.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
       if (up1.error) return res.status(500).json({ error: up1.error.message })
     }
-    for (const part of chunk(uniqueProducts, 200)) {
-      const up2 = await supabaseService
-        .from('products')
-        .upsert(part.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
-      if (up2.error) return res.status(500).json({ error: up2.error.message })
+    
+    // First, fetch ALL existing products from database to match against
+    const allExistingProducts = await fetchAllProducts()
+    
+    // Build product maps for matching
+    const prodMapForMatch = new Map<string, string>()
+    const exactProdMapForMatch = new Map<string, string>()
+    const strippedProdMapForMatch = new Map<string, string>()
+    
+    for (const p of allExistingProducts) {
+      const id = p.id
+      const nm = p.name
+      const cExact = canonName(nm)
+      const cStrip = canonName(stripLeadingTag(nm))
+      
+      if (cExact && !exactProdMapForMatch.has(cExact)) {
+        exactProdMapForMatch.set(cExact, id)
+        prodMapForMatch.set(nm, id)
+      }
+      if (cStrip && !strippedProdMapForMatch.has(cStrip)) {
+        strippedProdMapForMatch.set(cStrip, id)
+      }
+    }
+    
+    // Find which products need to be created (don't match existing products)
+    const productsToCreate: string[] = []
+    for (const productName of uniqueProducts) {
+      const match = findBestProductMatch(productName, prodMapForMatch, exactProdMapForMatch, strippedProdMapForMatch)
+      if (!match) {
+        productsToCreate.push(productName)
+      }
+    }
+    
+    // Only create products that don't exist
+    if (productsToCreate.length > 0) {
+      for (const part of chunk(productsToCreate, 200)) {
+        const up2 = await supabaseService
+          .from('products')
+          .upsert(part.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
+        if (up2.error) return res.status(500).json({ error: up2.error.message })
+      }
+      // Brief delay to ensure DB consistency
+      await new Promise(res => setTimeout(res, 100))
+      
+      // Re-fetch products to include newly created ones
+      const updatedProducts = await fetchAllProducts()
+      allExistingProducts.push(...updatedProducts.filter(p => productsToCreate.includes(p.name)))
+    }
+    
+    // Final product list with all products (existing + newly created)
+    const prodRows = await fetchAllProducts()
+    
+    // Re-build maps after creating new products (in case they were created)
+    const prodMap = new Map<string, string>()
+    const exactProdMap = new Map<string, string>()
+    const strippedProdMap = new Map<string, string>()
+    
+    for (const p of prodRows) {
+      const id = p.id
+      const nm = p.name
+      const cExact = canonName(nm)
+      const cStrip = canonName(stripLeadingTag(nm))
+      
+      if (cExact && !exactProdMap.has(cExact)) {
+        exactProdMap.set(cExact, id)
+        prodMap.set(nm, id) // exact name
+      }
+      if (cStrip && !strippedProdMap.has(cStrip)) {
+        strippedProdMap.set(cStrip, id)
+      }
+    }
+    
+    // Map names → ids for customers
+    const custRows = await selectByNames('customers', uniqueCustomers)
+    
+    // Build customer map with exact and normalized keys
+    const custMap = new Map<string, string>()
+    for (const c of custRows) {
+      const normalized = c.name.trim().toLowerCase()
+      if (!custMap.has(normalized)) {
+        custMap.set(c.name, c.id) // exact match
+        custMap.set(normalized, c.id) // normalized match
+      }
+    }
+    
+    // Helper functions
+    const findCustomerId = (name: string): string | undefined => {
+      return custMap.get(name) || custMap.get(name.trim().toLowerCase())
+    }
+    
+    const findProductId = (name: string): string | undefined => {
+      return findBestProductMatch(name, prodMap, exactProdMap, strippedProdMap)
     }
 
-    // Map names → ids
-    const custRows = await selectByNames('customers', uniqueCustomers)
-    const prodRows = await selectByNames('products', uniqueProducts)
-    const custMap = new Map(custRows.map(c => [c.name, c.id]))
-    const prodMap = new Map(prodRows.map(p => [p.name, p.id]))
-
-    // Build sales payload
+    // Build sales payload and track unmapped rows
     const salesPayload = clean
-      .map(r => ({
-        date: r.Date,
-        quantity: r.Quantity,
-        unit_price: r.Price, // may be null
-        customer_id: custMap.get(r.Customer) as string | undefined,
-        product_id: prodMap.get(r.Product) as string | undefined
-      }))
-      .filter(x => x.customer_id && x.product_id) as Array<{
+      .map((r) => {
+        const customer_id = findCustomerId(r.Customer)
+        const product_id = findProductId(r.Product)
+        
+        // Track unmapped issues
+        if (!customer_id) {
+          reject(r.rowNum, `Customer not found in database: "${r.Customer}"`)
+        }
+        if (!product_id) {
+          reject(r.rowNum, `Product not found in database: "${r.Product}"`)
+        }
+        
+        return customer_id && product_id ? {
+          date: r.Date,
+          quantity: r.Quantity,
+          unit_price: r.Price, // may be null
+          customer_id: customer_id,
+          product_id: product_id
+        } : null
+      })
+      .filter(x => x !== null) as Array<{
         date: string; quantity: number; unit_price: number | null; customer_id: string; product_id: string;
       }>
 
@@ -249,7 +395,10 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       inserted,
       rejectedCount: rejected.length,
       reasonCounts: Object.fromEntries(reasonCounts),
-      sampleRejected: rejected.slice(0, 50)
+      sampleRejected: rejected.slice(0, 100), // Show first 100 rejected rows
+      totalRowsProcessed: body.length,
+      acceptedRows: clean.length,
+      finalInserted: inserted
     })
   } catch (e: any) {
     console.error('UNHANDLED /api/upload error:', e)
