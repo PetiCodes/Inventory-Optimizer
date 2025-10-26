@@ -95,6 +95,25 @@ async function fetchAllProducts(): Promise<Array<{ id: string; name: string }>> 
 
 /* --------------------------- route --------------------------- */
 
+/**
+ * Inventory Upload Endpoint
+ * 
+ * Behavior:
+ * - Duplicate Prevention: Products are matched using normalized names before creation.
+ *   If an uploaded product matches an existing product (by name or stripped name), the
+ *   existing product is used and NO duplicate is created.
+ * 
+ * - First upload: Creates new products, sets prices with today's date, updates inventory
+ * 
+ * - Re-upload of existing products:
+ *   1. Existing products are matched by name and their values are updated
+ *   2. Updates the most recent price entry (not creates new daily entry)
+ *   3. NO duplicate products are created
+ * 
+ * - New products in re-upload: Only truly new products are created with today's date
+ * 
+ * - Inventory is always updated for all matched products
+ */
 router.post('/inventory/upload', upload.single('file'), async (req, res) => {
   const stage = {
     parse: false,
@@ -194,31 +213,100 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
     const clean = Array.from(agg.values())
     stage.builtAgg = clean.length
 
-    // Ensure products exist
-    const uniqueNames = clean.map(r => r.name)
-    for (const part of chunk(uniqueNames, 75)) {
-      const up = await supabaseService
-        .from('products')
-        .upsert(part.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
-      if (up.error) return res.status(500).json({ error: up.error.message, stage, step: 'upsert_products' })
-      stage.upsertProducts += part.length
-      await sleep(5)
-    }
-
-    // **FIX: fetch ALL products with pagination (no 1000-row cap)**
+    // **Step 1: Fetch ALL existing products first (with pagination)**
     const allProducts = await fetchAllProducts()
     stage.fetchedProducts = allProducts.length
 
-    // Build mapping keys
+    // Build mapping keys for matching
     const exactMap = new Map<string, string>()
     const strippedMap = new Map<string, string>()
+    const normalizedToOriginal = new Map<string, string>() // Store original DB names
+    
     for (const p of allProducts) {
       const id = p.id
       const nm = p.name
       const cExact = canonName(nm)
       const cStrip = canonName(stripLeadingTag(nm))
-      if (cExact && !exactMap.has(cExact)) exactMap.set(cExact, id)
-      if (cStrip && !strippedMap.has(cStrip)) strippedMap.set(cStrip, id)
+      if (cExact && !exactMap.has(cExact)) {
+        exactMap.set(cExact, id)
+        normalizedToOriginal.set(cExact, nm)
+      }
+      if (cStrip && !strippedMap.has(cStrip)) {
+        strippedMap.set(cStrip, id)
+      }
+    }
+
+    // **Step 2: Match uploaded products to existing products**
+    const uploadedProducts = new Map<string, { id: string; name: string }>()
+    const productsToCreate: string[] = []
+    
+    for (const r of clean) {
+      // Try to find existing product using matching logic
+      const cName = canonName(r.name)
+      const cStrip = canonName(stripLeadingTag(r.name))
+      
+      const byExact = exactMap.get(cName)
+      const byStrip = exactMap.get(cStrip) || strippedMap.get(cStrip)
+      const pid = byExact || byStrip
+      
+      if (pid) {
+        // Product already exists - don't create it
+        uploadedProducts.set(r.name, { id: pid, name: r.name })
+      } else {
+        // Product doesn't exist - will need to create it
+        productsToCreate.push(r.name)
+      }
+    }
+
+    // **Step 3: Create only products that don't exist yet**
+    if (productsToCreate.length > 0) {
+      for (const part of chunk(productsToCreate, 75)) {
+        const up = await supabaseService
+          .from('products')
+          .upsert(part.map(name => ({ name })), { onConflict: 'name', ignoreDuplicates: true })
+        if (up.error) return res.status(500).json({ error: up.error.message, stage, step: 'upsert_products' })
+        stage.upsertProducts += part.length
+        await sleep(5)
+      }
+      
+      // Fetch the newly created products and add them to uploadedProducts
+      const newProducts = await supabaseService
+        .from('products')
+        .select('id, name')
+        .in('name', productsToCreate)
+      
+      if (!newProducts.error && newProducts.data) {
+        for (const p of newProducts.data) {
+          uploadedProducts.set(String(p.name), { id: String(p.id), name: String(p.name) })
+        }
+      }
+    }
+
+    // **Step 4: Build mapping: product_id -> most_recent_effective_date for existing products**
+    const allProductIds = Array.from(uploadedProducts.values()).map(p => p.id)
+
+    // Fetch existing prices for all products in batch
+    // Note: PostgREST doesn't support window functions, so we fetch all prices and process in JS
+    const existingPricesMap = new Map<string, string>()
+    const productIdsArray = Array.from(allProductIds)
+    for (const part of chunk(productIdsArray, 500)) {
+      const existingPrices = await supabaseService
+        .from('product_prices')
+        .select('product_id, effective_date')
+        .in('product_id', part)
+
+      if (existingPrices.data) {
+        // Group by product_id and keep the most recent date
+        for (const row of existingPrices.data) {
+          const pid = String(row.product_id)
+          const date = String(row.effective_date)
+          const existing = existingPricesMap.get(pid)
+          if (!existing || date > existing) {
+            existingPricesMap.set(pid, date)
+          }
+        }
+      }
+      await sleep(3)
     }
 
     // Build payloads
@@ -231,20 +319,23 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     const unmatched: string[] = []
 
+    // **Step 5: Build payloads using the matched products**
     for (const r of clean) {
-      const byExact = exactMap.get(r.name)
-      const byStrip = exactMap.get(canonName(stripLeadingTag(r.name))) || strippedMap.get(canonName(stripLeadingTag(r.name)))
-      const pid = byExact ?? byStrip
-      if (!pid) {
+      const product = uploadedProducts.get(r.name)
+      if (!product) {
         unmatched.push(r.name)
         continue
       }
 
+      const pid = product.id
       const unit_cost  = Number.isFinite(Number(r.unit_cost))  ? Number(r.unit_cost)  : 0
       const unit_price = Number.isFinite(Number(r.unit_price)) ? Number(r.unit_price) : 0
       const on_hand    = Number.isFinite(Number(r.on_hand))    ? Number(r.on_hand)    : 0
 
-      pricePayload.push({ product_id: pid, effective_date: todayISO, unit_cost, unit_price })
+      // Use existing effective_date if product already has prices, otherwise use today
+      const effectiveDate = existingPricesMap.get(pid) || todayISO
+      
+      pricePayload.push({ product_id: pid, effective_date: effectiveDate, unit_cost, unit_price })
       invPayload.push({ product_id: pid, on_hand, backorder: 0 })
     }
 
