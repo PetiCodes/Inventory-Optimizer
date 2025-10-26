@@ -269,20 +269,57 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
         await sleep(5)
       }
       
-      // Fetch the newly created products and add them to uploadedProducts
-      const newProducts = await supabaseService
-        .from('products')
-        .select('id, name')
-        .in('name', productsToCreate)
+      // Re-fetch ALL products to rebuild maps with newly created products
+      const updatedProducts = await fetchAllProducts()
       
-      if (!newProducts.error && newProducts.data) {
-        for (const p of newProducts.data) {
-          uploadedProducts.set(String(p.name), { id: String(p.id), name: String(p.name) })
+      // Rebuild mapping keys to include new products
+      for (const p of updatedProducts) {
+        const id = p.id
+        const nm = p.name
+        const cExact = canonName(nm)
+        const cStrip = canonName(stripLeadingTag(nm))
+        if (cExact && !exactMap.has(cExact)) {
+          exactMap.set(cExact, id)
+        }
+        if (cStrip && !strippedMap.has(cStrip)) {
+          strippedMap.set(cStrip, id)
+        }
+      }
+      
+      // Re-match ALL products in case they match newly created ones
+      for (const r of clean) {
+        if (!uploadedProducts.has(r.name)) {
+          const cName = canonName(r.name)
+          const cStrip = canonName(stripLeadingTag(r.name))
+          const byExact = exactMap.get(cName)
+          const byStrip = exactMap.get(cStrip) || strippedMap.get(cStrip)
+          const pid = byExact || byStrip
+          if (pid) {
+            uploadedProducts.set(r.name, { id: pid, name: r.name })
+          }
         }
       }
     }
 
-    // **Step 4: Build mapping: product_id -> most_recent_effective_date for existing products**
+    // **Step 4: Verify all products are matched**
+    const unmatchedProducts: string[] = []
+    for (const r of clean) {
+      if (!uploadedProducts.has(r.name)) {
+        unmatchedProducts.push(r.name)
+      }
+    }
+    
+    if (unmatchedProducts.length > 0) {
+      return res.status(400).json({
+        error: 'Failed to match or create some products',
+        unmatchedProducts: unmatchedProducts.slice(0, 50),
+        unmatchedCount: unmatchedProducts.length,
+        stage,
+        details: 'Products could not be matched to existing products and failed to be created in the database.'
+      })
+    }
+
+    // **Step 5: Build mapping: product_id -> most_recent_effective_date for existing products**
     const allProductIds = Array.from(uploadedProducts.values()).map(p => p.id)
 
     // Fetch existing prices for all products in batch
@@ -319,10 +356,13 @@ router.post('/inventory/upload', upload.single('file'), async (req, res) => {
 
     const unmatched: string[] = []
 
-    // **Step 5: Build payloads using the matched products**
+    // **Step 6: Build payloads using the matched products**
+    console.log(`Building payloads for ${clean.length} products, uploadedProducts has ${uploadedProducts.size} entries`)
+    
     for (const r of clean) {
       const product = uploadedProducts.get(r.name)
       if (!product) {
+        console.warn(`Product not found in uploadedProducts: "${r.name}"`)
         unmatched.push(r.name)
         continue
       }
