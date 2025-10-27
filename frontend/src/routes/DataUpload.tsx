@@ -305,7 +305,7 @@ export default function DataUpload() {
 
   /** ----------------- Delete Sales Data Only ----------------- */
   async function deleteSalesData() {
-    const c1 = window.confirm('This will permanently delete ALL sales data. Products and customers will be kept. Continue?')
+    const c1 = window.confirm('This will permanently delete ALL sales data and customers. Products will be kept. Continue?')
     if (!c1) return
 
     try {
@@ -318,8 +318,9 @@ export default function DataUpload() {
       const data = await res.json()
       if (!res.ok) throw new Error(data?.error || 'Failed to delete')
       
-      const deletedCount = data.deleted?.sales_rows ?? 0
-      addToast(`Sales data deleted. ${deletedCount} sales records removed.`, 'success')
+      const salesCount = data.deleted?.sales_rows ?? 0
+      const custCount = data.deleted?.customers_rows ?? 0
+      addToast(`Sales data deleted. ${salesCount} sales and ${custCount} customers removed. Products kept.`, 'success')
 
       // Reset sales-related UI state
       setSalesFile(null)
@@ -335,7 +336,7 @@ export default function DataUpload() {
 
   /** ----------------- Delete Inventory Data Only ----------------- */
   async function deleteInventoryData() {
-    const c1 = window.confirm('This will permanently delete ALL inventory and pricing data. Products will be kept. Continue?')
+    const c1 = window.confirm('This will permanently delete ALL inventory, pricing data, and products. Continue?')
     if (!c1) return
 
     try {
@@ -350,7 +351,8 @@ export default function DataUpload() {
       
       const invCount = data.deleted?.inventory_rows ?? 0
       const priceCount = data.deleted?.price_rows ?? 0
-      addToast(`Inventory data deleted. ${invCount} inventory records and ${priceCount} price records removed.`, 'success')
+      const prodCount = data.deleted?.products_rows ?? 0
+      addToast(`Inventory data deleted. ${invCount} inventory, ${priceCount} price records, ${prodCount} products removed.`, 'success')
 
       // Reset inventory-related UI state
       setInvFile(null)
