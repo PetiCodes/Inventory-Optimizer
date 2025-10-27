@@ -140,12 +140,12 @@ async function handleRefreshAtRisk(_req: any, res: any) {
     }
     
     // 3) Clear existing cache by deleting all rows
-    // Using .in('id', []) with a subquery would be ideal, but PostgREST doesn't support it directly
-    // Instead, we'll just delete with a condition that always matches
+    // Use .neq() with impossible UUID to match all rows
+    const impossibleUUID = '00000000-0000-0000-0000-000000000000'
     const clearRes = await supabaseService
       .from('product_at_risk_cache')
       .delete()
-      .gte('gap', -999999999) // Match all rows (gap can't be that negative)
+      .neq('id', impossibleUUID)
       
     if (clearRes.error) {
       console.warn('[refresh-at-risk] Clear error (non-fatal):', clearRes.error.message)
@@ -197,27 +197,36 @@ router.post('/admin/delete-inventory-data', async (_req, res) => {
     // Count before deletion
     const invCountBefore = await supabaseService.from('inventory_current').select('product_id', { count: 'exact', head: true })
     const priceCountBefore = await supabaseService.from('product_prices').select('product_id', { count: 'exact', head: true })
+    const prodCountBefore = await supabaseService.from('products').select('id', { count: 'exact', head: true })
     
-    // Delete inventory_current data - use a dummy value to match all
-    const invDel = await supabaseService.from('inventory_current').delete().like('product_id', '%')
+    // Delete inventory_current data - use .neq() with impossible UUID to match all rows
+    const impossibleUUID = '00000000-0000-0000-0000-000000000000'
+    const invDel = await supabaseService.from('inventory_current').delete().neq('product_id', impossibleUUID)
     if (invDel.error) {
       console.error('delete inventory_current error:', invDel.error)
       return res.status(500).json({ error: invDel.error.message })
     }
 
     // Delete product_prices data
-    const priceDel = await supabaseService.from('product_prices').delete().like('product_id', '%')
+    const priceDel = await supabaseService.from('product_prices').delete().neq('product_id', impossibleUUID)
     if (priceDel.error) {
       console.error('delete product_prices error:', priceDel.error)
       return res.status(500).json({ error: priceDel.error.message })
     }
 
+    // Also delete products (created by inventory uploads)
+    const prodDel = await supabaseService.from('products').delete().neq('id', impossibleUUID)
+    if (prodDel.error) {
+      console.warn('delete products error (non-fatal):', prodDel.error.message)
+    }
+
     return res.json({ 
       ok: true, 
-      message: 'Inventory data deleted successfully.',
+      message: 'Inventory data, prices, and products deleted successfully.',
       deleted: {
         inventory_rows: invCountBefore.count || 0,
-        price_rows: priceCountBefore.count || 0
+        price_rows: priceCountBefore.count || 0,
+        products_rows: prodCountBefore.count || 0
       }
     })
   } catch (e: any) {
@@ -231,19 +240,30 @@ router.post('/admin/delete-sales-data', async (_req, res) => {
   try {
     // Count before deletion
     const salesCountBefore = await supabaseService.from('sales').select('id', { count: 'exact', head: true })
+    const custCountBefore = await supabaseService.from('customers').select('id', { count: 'exact', head: true })
     
-    // Delete sales data
-    const salesDel = await supabaseService.from('sales').delete().like('id', '%')
+    // Delete sales data - use .neq() with impossible UUID to match all rows
+    const impossibleUUID = '00000000-0000-0000-0000-000000000000'
+    const salesDel = await supabaseService.from('sales').delete().neq('id', impossibleUUID)
     if (salesDel.error) {
       console.error('delete sales error:', salesDel.error)
       return res.status(500).json({ error: salesDel.error.message })
     }
 
+    // Also delete customers (created by sales uploads)
+    const custDel = await supabaseService.from('customers').delete().neq('id', impossibleUUID)
+    if (custDel.error) {
+      console.warn('delete customers error (non-fatal):', custDel.error.message)
+    }
+
+    // Keep products - they may be used in inventory
+
     return res.json({ 
       ok: true, 
-      message: 'Sales data deleted successfully.',
+      message: 'Sales data and customers deleted successfully.',
       deleted: {
-        sales_rows: salesCountBefore.count || 0
+        sales_rows: salesCountBefore.count || 0,
+        customers_rows: custCountBefore.count || 0
       }
     })
   } catch (e: any) {
