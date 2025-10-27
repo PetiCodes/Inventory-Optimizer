@@ -40,8 +40,15 @@ export default function DataUpload() {
   const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
   const [refreshErr, setRefreshErr] = useState<string | null>(null)
 
-  // Delete ALL data state
+  // Delete data state
   const [wiping, setWiping] = useState(false)
+  const [deletingSales, setDeletingSales] = useState(false)
+  const [deletingInventory, setDeletingInventory] = useState(false)
+
+  // At-risk refresh state
+  const [atRiskBusy, setAtRiskBusy] = useState(false)
+  const [atRiskMsg, setAtRiskMsg] = useState<string | null>(null)
+  const [atRiskErr, setAtRiskErr] = useState<string | null>(null)
 
   /** ----------------- Helpers ----------------- */
   function isCSV(name: string) { return /\.csv$/i.test(name) }
@@ -233,6 +240,34 @@ export default function DataUpload() {
     }
   }
 
+  /** ----------------- Recalculate At-Risk Products Cache ----------------- */
+  async function refreshAtRisk() {
+    setAtRiskErr(null)
+    setAtRiskMsg(null)
+    setAtRiskBusy(true)
+    try {
+      const token = (await supabase.auth.getSession()).data.session?.access_token
+      const headers = token ? { Authorization: `Bearer ${token}` } : undefined
+
+      let res = await fetch(`${API}/api/admin/refresh-at-risk`, { method: 'POST', headers })
+      if (res.status === 404) {
+        res = await fetch(`${API}/api/refresh-at-risk`, { method: 'POST', headers })
+      }
+      const json = await res.json()
+      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+
+      const msg = `Cache refreshed. ${json.rows ?? 0} products processed.`
+      setAtRiskMsg(msg)
+      addToast(msg, 'success')
+    } catch (e: any) {
+      const m = e.message || 'Refresh failed'
+      setAtRiskErr(m)
+      addToast(m, 'error')
+    } finally {
+      setAtRiskBusy(false)
+    }
+  }
+
   /** ----------------- Delete ALL Data (Danger) ----------------- */
   async function wipeAllData() {
     const c1 = window.confirm('This will permanently delete ALL sales, inventory, prices, customers, and products. Continue?')
@@ -268,6 +303,66 @@ export default function DataUpload() {
     }
   }
 
+  /** ----------------- Delete Sales Data Only ----------------- */
+  async function deleteSalesData() {
+    const c1 = window.confirm('This will permanently delete ALL sales data. Products and customers will be kept. Continue?')
+    if (!c1) return
+
+    try {
+      setDeletingSales(true)
+      const token = (await supabase.auth.getSession()).data.session?.access_token
+      const res = await fetch(`${API}/api/admin/delete-sales-data`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data?.error || 'Failed to delete')
+      
+      const deletedCount = data.deleted?.sales_rows ?? 0
+      addToast(`Sales data deleted. ${deletedCount} sales records removed.`, 'success')
+
+      // Reset sales-related UI state
+      setSalesFile(null)
+      setSalesRows([])
+      setSalesErrors([])
+      setSalesSummary(null)
+    } catch (e: any) {
+      addToast(e.message || 'Failed to delete sales data', 'error')
+    } finally {
+      setDeletingSales(false)
+    }
+  }
+
+  /** ----------------- Delete Inventory Data Only ----------------- */
+  async function deleteInventoryData() {
+    const c1 = window.confirm('This will permanently delete ALL inventory and pricing data. Products will be kept. Continue?')
+    if (!c1) return
+
+    try {
+      setDeletingInventory(true)
+      const token = (await supabase.auth.getSession()).data.session?.access_token
+      const res = await fetch(`${API}/api/admin/delete-inventory-data`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data?.error || 'Failed to delete')
+      
+      const invCount = data.deleted?.inventory_rows ?? 0
+      const priceCount = data.deleted?.price_rows ?? 0
+      addToast(`Inventory data deleted. ${invCount} inventory records and ${priceCount} price records removed.`, 'success')
+
+      // Reset inventory-related UI state
+      setInvFile(null)
+      setInvErrors([])
+      setInvSummary(null)
+    } catch (e: any) {
+      addToast(e.message || 'Failed to delete inventory data', 'error')
+    } finally {
+      setDeletingInventory(false)
+    }
+  }
+
   return (
     <AppShell>
       <div className="space-y-8">
@@ -291,6 +386,17 @@ export default function DataUpload() {
               )}
             </Button>
 
+            {/* At-Risk cache refresh button */}
+            <Button onClick={refreshAtRisk} disabled={atRiskBusy}>
+              {atRiskBusy ? (
+                <span className="inline-flex items-center gap-2">
+                  <Spinner size="sm" /> Refreshing…
+                </span>
+              ) : (
+                'Refresh At-Risk Cache'
+              )}
+            </Button>
+
             {/* Delete button: same visual style as recalc, but danger color */}
             <Button
               onClick={wipeAllData}
@@ -310,6 +416,8 @@ export default function DataUpload() {
 
         {refreshErr && <Alert variant="error">{refreshErr}</Alert>}
         {refreshMsg && <Alert variant="success">{refreshMsg}</Alert>}
+        {atRiskErr && <Alert variant="error">{atRiskErr}</Alert>}
+        {atRiskMsg && <Alert variant="success">{atRiskMsg}</Alert>}
 
         {/* ----------------- Sales Upload ----------------- */}
         <Card>
@@ -371,7 +479,20 @@ export default function DataUpload() {
               </div>
             )}
           </CardContent>
-          <CardFooter className="flex justify-end">
+          <CardFooter className="flex justify-between">
+            <Button
+              onClick={deleteSalesData}
+              disabled={deletingSales}
+              className="!bg-red-600 !text-white hover:!bg-red-700 focus-visible:!ring-2 focus-visible:!ring-red-500"
+            >
+              {deletingSales ? (
+                <span className="inline-flex items-center gap-2">
+                  <Spinner size="sm" /> Deleting…
+                </span>
+              ) : (
+                'Delete Sales Data'
+              )}
+            </Button>
             <Button onClick={uploadSales} disabled={salesUploading || !salesFile}>
               {salesUploading ? (
                 <span className="inline-flex items-center gap-2">
@@ -457,7 +578,20 @@ export default function DataUpload() {
               </Alert>
             )}
           </CardContent>
-          <CardFooter className="flex justify-end">
+          <CardFooter className="flex justify-between">
+            <Button
+              onClick={deleteInventoryData}
+              disabled={deletingInventory}
+              className="!bg-red-600 !text-white hover:!bg-red-700 focus-visible:!ring-2 focus-visible:!ring-red-500"
+            >
+              {deletingInventory ? (
+                <span className="inline-flex items-center gap-2">
+                  <Spinner size="sm" /> Deleting…
+                </span>
+              ) : (
+                'Delete Inventory Data'
+              )}
+            </Button>
             <Button onClick={uploadInventory} disabled={invUploading || !invFile}>
               {invUploading ? (
                 <span className="inline-flex items-center gap-2">
