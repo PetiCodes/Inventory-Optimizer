@@ -98,118 +98,68 @@ router.get('/dashboard/overview', async (req, res) => {
         }
       }
 
-    // 3) Per-product monthly aggregation (for MOQ calc identical to products.ts)
-    const perProdMonthly = new Map<string, number[]>() // pid -> [12]
-    {
-      // Define s12 for the monthly aggregation
-      const s12 = lastNMonthsScaffold(12)
-      const PAGE = 1000
-      for (let i = 0; i < 12; i++) {
-        const mStart = monthStartUTC(s12[i].y, s12[i].m0).toISOString().slice(0, 10)
-        const mEnd = monthEndUTC(s12[i].y, s12[i].m0).toISOString().slice(0, 10)
-
-        let offset = 0
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          const batch = await supabaseService
-            .from('sales')
-            .select('product_id,quantity')
-            .gte('date', mStart)
-            .lte('date', mEnd)
-            .range(offset, offset + PAGE - 1)
-
-          if (batch.error) return res.status(500).json({ error: batch.error.message })
-          const rows = (batch.data ?? []) as { product_id: string; quantity: number }[]
-          if (rows.length === 0) break
-
-          for (const r of rows) {
-            const pid = String(r.product_id)
-            if (!isUUID(pid)) continue
-            const arr = perProdMonthly.get(pid) ?? Array(12).fill(0)
-            arr[i] += Number(r.quantity ?? 0)
-            perProdMonthly.set(pid, arr)
-          }
-          if (rows.length < PAGE) break
-          offset += PAGE
-        }
-      }
-    }
-
-    // 4) On hand + backorder - we'll fetch this per product in the at-risk section for accuracy
-    const onHandMap = new Map<string, number>()
-    const backorderMap = new Map<string, number>()
-
-    // 5) At-Risk products section
+    // 3) At-Risk products section - Use cached data for fast retrieval
     let atRiskProducts: any[] = []
     {
       try {
-        // Get all products with names first
-        const { data: allProducts, error: productsError } = await supabaseService
-          .from('products')
-          .select('id,name')
-          .order('name', { ascending: true })
-
-        if (productsError) {
-          console.warn('[at-risk] Products query error:', productsError.message)
-        } else if (allProducts && allProducts.length > 0) {
-          // Process products in batches to balance performance and accuracy
-          const BATCH_SIZE = 100
-          const productBatches = []
-          for (let i = 0; i < allProducts.length; i += BATCH_SIZE) {
-            productBatches.push(allProducts.slice(i, i + BATCH_SIZE))
-          }
-
-          atRiskProducts = []
+        // Try to fetch from cache first
+        const cacheRes = await supabaseService
+          .from('product_at_risk_cache')
+          .select('product_id, product_name, on_hand, backorder, weighted_moq, gap')
+          .order('gap', { ascending: false })
+        
+        if (!cacheRes.error && cacheRes.data && cacheRes.data.length > 0) {
+          // Use cached data
+          atRiskProducts = cacheRes.data.map(r => ({
+            product_id: r.product_id,
+            product_name: r.product_name,
+            on_hand: r.on_hand,
+            weighted_moq: r.weighted_moq,
+            gap: r.gap
+          }))
+        } else {
+          // Fallback: calculate on-the-fly if cache is missing (for backwards compatibility)
+          console.warn('[at-risk] Cache not found, calculating on-the-fly...')
           
-          for (const batch of productBatches) {
-            const batchResults = await Promise.all(batch.map(async (product) => {
-              // Get sales data if available, otherwise use zeros
-              const monthlyData = perProdMonthly.get(product.id) || Array(12).fill(0)
-              
-              // Calculate weighted average from the 12 months of data
-              const weights = Array.from({ length: 12 }, (_, i) => i + 1)
-              const wSum = weights.reduce((a, b) => a + b, 0)
-              const weightedSum = monthlyData.reduce((acc, qty, i) => acc + qty * weights[i], 0)
-              const weightedAvg = wSum ? weightedSum / wSum : 0
-              const weighted_moq = Math.ceil(weightedAvg * ORDER_COVERAGE_MONTHS)
-              
-              // Get on-hand from inventory_current using the same method as individual product pages
-              let on_hand = 0
-              try {
-                const inv = await supabaseService
-                  .from('inventory_current')
-                  .select('on_hand, backorder')
-                  .eq('product_id', product.id)
-                  .maybeSingle()
-                
-                if (!inv.error && inv.data) {
-                  on_hand = Number(inv.data.on_hand ?? 0)
+          const { data: allProducts } = await supabaseService
+            .from('products')
+            .select('id,name')
+            .order('name', { ascending: true })
+
+          if (allProducts && allProducts.length > 0) {
+            const BATCH_SIZE = 100
+            for (let i = 0; i < allProducts.length; i += BATCH_SIZE) {
+              const batch = allProducts.slice(i, i + BATCH_SIZE)
+              const batchResults = await Promise.all(batch.map(async (product) => {
+                let on_hand = 0
+                try {
+                  const inv = await supabaseService
+                    .from('inventory_current')
+                    .select('on_hand')
+                    .eq('product_id', product.id)
+                    .maybeSingle()
+                  
+                  if (!inv.error && inv.data) {
+                    on_hand = Number(inv.data.on_hand ?? 0)
+                  }
+                } catch (e) {}
+
+                return {
+                  product_id: product.id,
+                  product_name: product.name || `Product ${product.id.slice(0, 8)}...`,
+                  on_hand,
+                  weighted_moq: 0,
+                  gap: 0
                 }
-              } catch (e) {
-                // Silent fail for individual products
-              }
+              }))
               
-              const gap = Math.max(0, weighted_moq - on_hand)
-
-              return {
-                product_id: product.id,
-                product_name: product.name || `Product ${product.id.slice(0, 8)}...`,
-                on_hand,
-                weighted_moq,
-                gap
-              }
-            }))
-            
-            atRiskProducts.push(...batchResults)
+              atRiskProducts.push(...batchResults)
+            }
           }
-
-          // Sort by gap (highest first) - show ALL products, not just top 20
-          atRiskProducts.sort((a, b) => b.gap - a.gap)
         }
         
       } catch (e: any) {
         console.error('[at-risk] Error:', e)
-        // Fallback: return empty array if there's an error
         atRiskProducts = []
       }
     }
