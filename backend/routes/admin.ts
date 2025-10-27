@@ -32,6 +32,148 @@ async function handleRefresh(_req: any, res: any) {
 router.post('/admin/refresh-gross-profit', handleRefresh)
 router.post('/refresh-gross-profit', handleRefresh) // alias
 
+/* ---------------- Refresh At-Risk Products Cache ---------------- */
+async function handleRefreshAtRisk(_req: any, res: any) {
+  try {
+    console.log('[refresh-at-risk] Starting...')
+    
+    // 1) Fetch ALL products with pagination to avoid Supabase 1000 row limit
+    const allProducts = []
+    let offset = 0
+    const PAGE_SIZE = 1000
+    
+    while (true) {
+      const productsQuery = await supabaseService
+        .from('products')
+        .select('id, name')
+        .range(offset, offset + PAGE_SIZE - 1)
+      
+      if (productsQuery.error) throw productsQuery.error
+      
+      const batch = productsQuery.data ?? []
+      if (batch.length === 0) break
+      
+      allProducts.push(...batch)
+      
+      if (batch.length < PAGE_SIZE) break // Last page
+      offset += PAGE_SIZE
+    }
+    
+    console.log(`[refresh-at-risk] Processing ${allProducts.length} products`)
+    
+    // 2) Calculate for each product (same logic as dashboard)
+    const ORDER_COVERAGE_MONTHS = 4
+    const weights = Array.from({ length: 12 }, (_, i) => i + 1)
+    const wSum = weights.reduce((a, b) => a + b, 0)
+    
+    // Get last 12 months
+    const now = new Date()
+    const last12Months = []
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getUTCFullYear(), now.getUTCMonth() - i, 1)
+      const mStart = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)).toISOString().slice(0, 10)
+      const mEnd = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).toISOString().slice(0, 10)
+      last12Months.push({ start: mStart, end: mEnd })
+    }
+    
+    const atRiskData = []
+    const BATCH_SIZE = 50
+    
+    for (let i = 0; i < allProducts.length; i += BATCH_SIZE) {
+      const batch = allProducts.slice(i, i + BATCH_SIZE)
+      const batchResults = await Promise.all(batch.map(async (product) => {
+        try {
+          // Get monthly sales for last 12 months
+          const monthlyQtys = []
+          for (const month of last12Months) {
+            const salesRes = await supabaseService
+              .from('sales')
+              .select('quantity')
+              .eq('product_id', product.id)
+              .gte('date', month.start)
+              .lte('date', month.end)
+            
+            if (!salesRes.error && salesRes.data) {
+              const totalQty = salesRes.data.reduce((sum: number, r: any) => sum + Number(r.quantity ?? 0), 0)
+              monthlyQtys.push(totalQty)
+            } else {
+              monthlyQtys.push(0)
+            }
+          }
+          
+          // Calculate weighted MOQ
+          const weightedSum = monthlyQtys.reduce((acc, qty, i) => acc + qty * weights[i], 0)
+          const weightedAvg = wSum ? weightedSum / wSum : 0
+          const weighted_moq = Math.ceil(weightedAvg * ORDER_COVERAGE_MONTHS)
+          
+          // Get inventory
+          const inv = await supabaseService
+            .from('inventory_current')
+            .select('on_hand, backorder')
+            .eq('product_id', product.id)
+            .maybeSingle()
+          
+          const on_hand = Number(inv.data?.on_hand ?? 0)
+          const backorder = Number(inv.data?.backorder ?? 0)
+          const gap = Math.max(0, weighted_moq - on_hand)
+          
+          return {
+            product_id: product.id,
+            product_name: product.name || '',
+            on_hand,
+            backorder,
+            weighted_moq,
+            gap
+          }
+        } catch (e) {
+          console.error(`[refresh-at-risk] Error for product ${product.id}:`, e)
+          return null
+        }
+      }))
+      
+      atRiskData.push(...batchResults.filter(Boolean))
+      
+      // Small delay to avoid overwhelming the DB
+      if (i + BATCH_SIZE < allProducts.length) {
+        await new Promise(res => setTimeout(res, 10))
+      }
+    }
+    
+    // 3) Clear existing cache by deleting all rows
+    // Using .in('id', []) with a subquery would be ideal, but PostgREST doesn't support it directly
+    // Instead, we'll just delete with a condition that always matches
+    const clearRes = await supabaseService
+      .from('product_at_risk_cache')
+      .delete()
+      .gte('gap', -999999999) // Match all rows (gap can't be that negative)
+      
+    if (clearRes.error) {
+      console.warn('[refresh-at-risk] Clear error (non-fatal):', clearRes.error.message)
+    } else {
+      console.log(`[refresh-at-risk] Cleared existing cache entries`)
+    }
+    
+    // 4) Insert new data in batches
+    let inserted = 0
+    for (let i = 0; i < atRiskData.length; i += 100) {
+      const batch = atRiskData.slice(i, i + 100)
+      const insRes = await supabaseService.from('product_at_risk_cache').insert(batch)
+      if (insRes.error) throw insRes.error
+      inserted += batch.length
+    }
+    
+    console.log(`[refresh-at-risk] Complete. Inserted ${inserted} products.`)
+    
+    return res.json({ ok: true, rows: inserted, products_processed: allProducts.length })
+  } catch (e: any) {
+    console.error('refresh-at-risk error:', e)
+    return res.status(500).json({ error: e?.message || 'Refresh failed' })
+  }
+}
+
+router.post('/admin/refresh-at-risk', handleRefreshAtRisk)
+router.post('/refresh-at-risk', handleRefreshAtRisk) // alias
+
 /* ---------------- Wipe All Data ---------------- */
 router.post('/admin/wipe-data', async (_req, res) => {
   try {
@@ -46,6 +188,67 @@ router.post('/admin/wipe-data', async (_req, res) => {
   } catch (e: any) {
     console.error('wipe-all-data unhandled:', e)
     return res.status(500).json({ error: e?.message || 'Failed to wipe data' })
+  }
+})
+
+/* ---------------- Delete Inventory Data Only ---------------- */
+router.post('/admin/delete-inventory-data', async (_req, res) => {
+  try {
+    // Count before deletion
+    const invCountBefore = await supabaseService.from('inventory_current').select('product_id', { count: 'exact', head: true })
+    const priceCountBefore = await supabaseService.from('product_prices').select('product_id', { count: 'exact', head: true })
+    
+    // Delete inventory_current data - use a dummy value to match all
+    const invDel = await supabaseService.from('inventory_current').delete().like('product_id', '%')
+    if (invDel.error) {
+      console.error('delete inventory_current error:', invDel.error)
+      return res.status(500).json({ error: invDel.error.message })
+    }
+
+    // Delete product_prices data
+    const priceDel = await supabaseService.from('product_prices').delete().like('product_id', '%')
+    if (priceDel.error) {
+      console.error('delete product_prices error:', priceDel.error)
+      return res.status(500).json({ error: priceDel.error.message })
+    }
+
+    return res.json({ 
+      ok: true, 
+      message: 'Inventory data deleted successfully.',
+      deleted: {
+        inventory_rows: invCountBefore.count || 0,
+        price_rows: priceCountBefore.count || 0
+      }
+    })
+  } catch (e: any) {
+    console.error('delete-inventory-data unhandled:', e)
+    return res.status(500).json({ error: e?.message || 'Failed to delete inventory data' })
+  }
+})
+
+/* ---------------- Delete Sales Data Only ---------------- */
+router.post('/admin/delete-sales-data', async (_req, res) => {
+  try {
+    // Count before deletion
+    const salesCountBefore = await supabaseService.from('sales').select('id', { count: 'exact', head: true })
+    
+    // Delete sales data
+    const salesDel = await supabaseService.from('sales').delete().like('id', '%')
+    if (salesDel.error) {
+      console.error('delete sales error:', salesDel.error)
+      return res.status(500).json({ error: salesDel.error.message })
+    }
+
+    return res.json({ 
+      ok: true, 
+      message: 'Sales data deleted successfully.',
+      deleted: {
+        sales_rows: salesCountBefore.count || 0
+      }
+    })
+  } catch (e: any) {
+    console.error('delete-sales-data unhandled:', e)
+    return res.status(500).json({ error: e?.message || 'Failed to delete sales data' })
   }
 })
 
