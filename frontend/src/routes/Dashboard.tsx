@@ -197,7 +197,7 @@ export default function Dashboard() {
                             <Button
                               size="sm"
                               variant="secondary"
-                              onClick={() => navigate(`/products/${r.product_id}`)}
+                              onClick={() => window.open(`/products/${r.product_id}`, '_blank')}
                             >
                               View
                             </Button>
