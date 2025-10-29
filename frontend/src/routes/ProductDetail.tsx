@@ -24,7 +24,7 @@ type ApiResp = {
     current_unit_price: number | null
   }
   profit_window?: {
-    mode: 'last12' | 'year'
+    mode: 'last12' | 'year' | 'allyears'
     year?: number
     total_qty: number
     total_revenue: number
@@ -43,7 +43,7 @@ export default function ProductDetail() {
   const { id } = useParams()
 
   // View state
-  const [mode, setMode] = useState<'last12' | 'year'>('last12')
+  const [mode, setMode] = useState<'last12' | 'year' | 'allyears'>('last12')
   const [year, setYear] = useState<number>(new Date().getFullYear())
 
   // Data state
@@ -141,6 +141,12 @@ export default function ProductDetail() {
                   >
                     Specific year
                   </button>
+                  <button
+                    className={`px-3 py-1 rounded-md text-sm ${mode === 'allyears' ? 'bg-white shadow font-medium' : 'text-gray-600'}`}
+                    onClick={() => setMode('allyears')}
+                  >
+                    All years
+                  </button>
                 </div>
 
                 {mode === 'year' && (
@@ -193,7 +199,7 @@ export default function ProductDetail() {
               <Card>
                 <CardContent className="p-6">
                   <p className="text-sm text-gray-600">
-                    Gross Profit ({mode === 'year' ? year : 'last 12'})
+                    Gross Profit ({mode === 'year' ? year : mode === 'allyears' ? 'all years' : 'last 12'})
                   </p>
                   <p className="text-2xl font-bold text-gray-900">
                     {grossProfit != null ? Number(grossProfit).toFixed(2) : '—'}
@@ -237,7 +243,7 @@ export default function ProductDetail() {
             <Card>
               <CardHeader>
                 <h3 className="text-lg font-semibold text-gray-900">
-                  Monthly Sales (Qty) — {mode === 'year' ? year : 'Last 12 months'}
+                  Monthly Sales (Qty) — {mode === 'year' ? year : mode === 'allyears' ? 'All years' : 'Last 12 months'}
                 </h3>
               </CardHeader>
               <CardContent>
