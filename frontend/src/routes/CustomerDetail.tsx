@@ -44,7 +44,7 @@ export default function CustomerDetail() {
   const [err, setErr] = useState<string | null>(null)
 
   // Monthly chart state
-  const [mode, setMode] = useState<'last12' | 'year'>('last12')
+  const [mode, setMode] = useState<'last12' | 'year' | 'allyears'>('last12')
   const [year, setYear] = useState<number>(new Date().getFullYear())
   const [monthly, setMonthly] = useState<MonthlyPoint[]>([])
   const [loadingMonthly, setLoadingMonthly] = useState(false)
@@ -231,6 +231,14 @@ export default function CustomerDetail() {
                       onClick={() => setMode('year')}
                     >
                       Specific year
+                    </button>
+                    <button
+                      className={`px-3 py-1 rounded-md text-sm ${
+                        mode === 'allyears' ? 'bg-white shadow font-medium' : 'text-gray-600'
+                      }`}
+                      onClick={() => setMode('allyears')}
+                    >
+                      All years
                     </button>
                   </div>
 
