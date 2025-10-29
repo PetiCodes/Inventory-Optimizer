@@ -29,6 +29,22 @@ function scaffoldYearUTC(year: number) {
     return { key: ymKeyUTC(d), y: d.getUTCFullYear(), m0: d.getUTCMonth() }
   })
 }
+function scaffoldAllYears(startYear: number, startMonth: number, endYear: number, endMonth: number) {
+  const out: { key: string; y: number; m0: number }[] = []
+  let y = startYear
+  let m = startMonth
+  
+  while (y < endYear || (y === endYear && m <= endMonth)) {
+    const d = monthStartUTC(y, m)
+    out.push({ key: ymKeyUTC(d), y, m0: m })
+    m++
+    if (m > 11) {
+      m = 0
+      y++
+    }
+  }
+  return out
+}
 function stddev(nums: number[]): number {
   if (!nums.length) return 0
   const mean = nums.reduce((a, b) => a + b, 0) / nums.length
@@ -177,10 +193,59 @@ router.get('/products/:id/overview', async (req, res) => {
 
     // Time window
     let scaffold: { key: string; y: number; m0: number }[]
-    let rangeStartISO: string
-    let rangeEndISO: string
+    let rangeStartISO: string | undefined
+    let rangeEndISO: string | undefined
 
-    if (mode === 'year' && year && Number.isFinite(year)) {
+    if (mode === 'allyears') {
+      // For all years, first get the date range from all sales
+      const allSalesQ = await supabaseService
+        .from('sales')
+        .select('date')
+        .eq('product_id', productId)
+        .order('date', { ascending: true })
+      
+      if (allSalesQ.error) return res.status(500).json({ error: allSalesQ.error.message })
+      
+      const allDates = (allSalesQ.data ?? []).map(r => new Date(String(r.date) + 'T00:00:00Z'))
+      
+      if (allDates.length === 0) {
+        // No sales data, return empty result
+        return res.json({
+          product: prod.data,
+          monthly: [],
+          seasonality: [],
+          topCustomers: [],
+          customers: [],
+          pricing: {
+            average_selling_price: 0,
+            current_unit_cost: 0,
+            current_unit_price: 0,
+          },
+          profit_window: {
+            mode: 'allyears',
+            total_qty: 0,
+            total_revenue: 0,
+            unit_cost_used: 0,
+            gross_profit: 0,
+          },
+          stats12: { weighted_avg_12m: 0, sigma_12m: 0, weighted_moq: 0 },
+          inventory: { on_hand: 0, backorder: 0 },
+        })
+      }
+      
+      const firstDate = allDates[0]
+      const lastDate = allDates[allDates.length - 1]
+      
+      scaffold = scaffoldAllYears(
+        firstDate.getUTCFullYear(),
+        firstDate.getUTCMonth(),
+        lastDate.getUTCFullYear(),
+        lastDate.getUTCMonth()
+      )
+      // Don't set date range filters for all years - we'll filter in the query later or fetch all
+      rangeStartISO = undefined
+      rangeEndISO = undefined
+    } else if (mode === 'year' && year && Number.isFinite(year)) {
       scaffold = scaffoldYearUTC(year)
       rangeStartISO = `${year}-01-01`
       rangeEndISO = `${year}-12-31`
@@ -193,16 +258,20 @@ router.get('/products/:id/overview', async (req, res) => {
     }
 
     // Sales for the window
-    const salesQ = await supabaseService
+    let salesQ = supabaseService
       .from('sales')
       .select('date, quantity, unit_price, customer_id')
       .eq('product_id', productId)
-      .gte('date', rangeStartISO)
-      .lte('date', rangeEndISO)
-      .order('date', { ascending: true })
+    
+    if (rangeStartISO) salesQ = salesQ.gte('date', rangeStartISO)
+    if (rangeEndISO) salesQ = salesQ.lte('date', rangeEndISO)
+    
+    salesQ = salesQ.order('date', { ascending: true })
+    
+    const salesResult = await salesQ
 
-    if (salesQ.error) return res.status(500).json({ error: salesQ.error.message })
-    const sales = (salesQ.data ?? []).map(r => ({
+    if (salesResult.error) return res.status(500).json({ error: salesResult.error.message })
+    const sales = (salesResult.data ?? []).map(r => ({
       date: String(r.date),
       qty: Number(r.quantity ?? 0),
       unit_price: Number(r.unit_price ?? 0),
@@ -290,19 +359,22 @@ router.get('/products/:id/overview', async (req, res) => {
     if (topRes.error) return res.status(500).json({ error: topRes.error.message })
 
     // All customers in the selected window (aggregate qty in Node)
-    const salesCust = await supabaseService
+    let salesCust = supabaseService
       .from('sales')
       .select('customer_id, quantity')
       .eq('product_id', productId)
-      .gte('date', rangeStartISO)
-      .lte('date', rangeEndISO)
+    
+    if (rangeStartISO) salesCust = salesCust.gte('date', rangeStartISO)
+    if (rangeEndISO) salesCust = salesCust.lte('date', rangeEndISO)
+    
+    const salesCustResult = await salesCust
 
-    if (salesCust.error) {
-      return res.status(500).json({ error: salesCust.error.message })
+    if (salesCustResult.error) {
+      return res.status(500).json({ error: salesCustResult.error.message })
     }
 
     const qtyByCustomer = new Map<string, number>()
-    for (const r of salesCust.data ?? []) {
+    for (const r of salesCustResult.data ?? []) {
       const cid = String((r as any).customer_id)
       const q = Number((r as any).quantity ?? 0)
       qtyByCustomer.set(cid, (qtyByCustomer.get(cid) || 0) + q)
