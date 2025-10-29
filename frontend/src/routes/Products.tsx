@@ -6,7 +6,6 @@ import Table, { TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import Button from '../components/ui/Button'
 import Alert from '../components/ui/Alert'
 import Spinner from '../components/ui/Spinner'
-import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 
 type Row = {
@@ -25,7 +24,6 @@ const fmtNumber = (n: number) =>
   new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(n)
 
 export default function Products() {
-  const navigate = useNavigate()
 
   // search (debounced)
   const [typing, setTyping] = useState('')
@@ -170,7 +168,7 @@ export default function Products() {
                         <TableCell className="text-right">{fmtCurrency(p.gross_profit_12m)}</TableCell>
                         <TableCell className="text-right">{fmtNumber(p.on_hand)}</TableCell>
                         <TableCell className="text-right">
-                          <Button size="sm" onClick={() => navigate(`/products/${p.id}`)}>
+                          <Button size="sm" onClick={() => window.open(`/products/${p.id}`, '_blank')}>
                             View
                           </Button>
                         </TableCell>
