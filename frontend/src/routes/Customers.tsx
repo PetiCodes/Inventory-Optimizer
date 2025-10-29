@@ -6,14 +6,12 @@ import Button from '../components/ui/Button'
 import Input from '../components/ui/Input'
 import Spinner from '../components/ui/Spinner'
 import Alert from '../components/ui/Alert'
-import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 
 type Customer = { id: string; name: string }
 type ApiList = { items: Customer[]; total: number; page: number; pageSize: number }
 
 export default function Customers() {
-  const navigate = useNavigate()
 
   const [page, setPage] = useState(1)
   const pageSize = 15
@@ -137,7 +135,7 @@ export default function Customers() {
                       <TableCell className="text-right">
                         <Button
                           size="sm"
-                          onClick={() => navigate(`/customers/${c.id}`)}
+                          onClick={() => window.open(`/customers/${c.id}`, '_blank')}
                         >
                           View
                         </Button>
