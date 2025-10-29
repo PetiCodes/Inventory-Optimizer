@@ -10,6 +10,7 @@ import Products from './routes/Products'
 import ProductDetail from './routes/ProductDetail'
 import Customers from './routes/Customers'
 import CustomerDetail from './routes/CustomerDetail'
+import Export from './routes/Export'
 import { ToastProvider } from './components/ToastProvider'
 import { supabase } from './lib/supabaseClient'
 import './index.css'
@@ -109,6 +110,14 @@ const router = createBrowserRouter([
     element: (
       <Protected>
         <CustomerDetail />
+      </Protected>
+    )
+  },
+  {
+    path: '/export',
+    element: (
+      <Protected>
+        <Export />
       </Protected>
     )
   },
