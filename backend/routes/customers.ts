@@ -191,10 +191,38 @@ router.get('/customers/:id/monthly', async (req, res) => {
     const mode = String(req.query.mode || 'last12')
     const year = req.query.year ? Number(req.query.year) : null
 
-    let start: Date, end: Date, label: string
+    let start: Date | undefined, end: Date | undefined, label: string
     const today = new Date()
 
-    if (mode === 'year' && year && Number.isFinite(year)) {
+    if (mode === 'allyears') {
+      // For all years, first get the date range from all sales
+      const allSalesQ = await supabaseService
+        .from('sales')
+        .select('date')
+        .eq('customer_id', customerId)
+        .order('date', { ascending: true })
+      
+      if (allSalesQ.error) return res.status(500).json({ error: allSalesQ.error.message })
+      
+      const allDates = (allSalesQ.data ?? []).map(r => new Date(String(r.date) + 'T00:00:00Z'))
+      
+      if (allDates.length === 0) {
+        return res.json({
+          mode: 'allyears',
+          label: 'all years',
+          start: null,
+          end: null,
+          points: []
+        })
+      }
+      
+      const firstDate = allDates[0]
+      const lastDate = allDates[allDates.length - 1]
+      
+      start = new Date(Date.UTC(firstDate.getUTCFullYear(), firstDate.getUTCMonth(), 1))
+      end = new Date(Date.UTC(lastDate.getUTCFullYear(), lastDate.getUTCMonth() + 1, 0))
+      label = 'all years'
+    } else if (mode === 'year' && year && Number.isFinite(year)) {
       start = new Date(Date.UTC(year, 0, 1))
       end   = new Date(Date.UTC(year, 11, 31))
       label = String(year)
@@ -206,40 +234,62 @@ router.get('/customers/:id/monthly', async (req, res) => {
       label = 'last12'
     }
 
-    const startStr = start.toISOString().slice(0, 10)
-    const endStr = end.toISOString().slice(0, 10)
+    const startStr = start ? start.toISOString().slice(0, 10) : undefined
+    const endStr = end ? end.toISOString().slice(0, 10) : undefined
 
-    const { data, error } = await supabaseService
+    let salesQuery = supabaseService
       .from('sales')
       .select('date, quantity')
       .eq('customer_id', customerId)
-      .gte('date', startStr)
-      .lte('date', endStr)
+    
+    if (startStr) salesQuery = salesQuery.gte('date', startStr)
+    if (endStr) salesQuery = salesQuery.lte('date', endStr)
+
+    const { data, error } = await salesQuery
 
     if (error) return res.status(500).json({ error: error.message })
 
-    const months: { key: string; label: string; total: number }[] = []
-    const startYear = start.getUTCFullYear()
-    const startMonth = start.getUTCMonth()
     const keyOf = (d: Date) => `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+    const monthMap = new Map<string, number>()
 
-    for (let i = 0; i < 12; i++) {
-      const d = new Date(Date.UTC(startYear, startMonth + i, 1))
-      months.push({ key: keyOf(d), label: d.toISOString().slice(0, 7), total: 0 })
+    // Build month map from all sales
+    for (const row of (data ?? [])) {
+      const d = new Date(String(row.date) + 'T00:00:00Z')
+      const k = keyOf(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)))
+      monthMap.set(k, (monthMap.get(k) || 0) + Number(row.quantity || 0))
     }
 
-    for (const row of (data ?? [])) {
-      const d = new Date(String(row.date))
-      const k = keyOf(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)))
-      const bucket = months.find(m => m.key === k)
-      if (bucket) bucket.total += Number(row.quantity || 0)
+    // Create months array from start to end
+    const months: { key: string; label: string; total: number }[] = []
+    
+    if (start && end) {
+      let currentYear = start.getUTCFullYear()
+      let currentMonth = start.getUTCMonth()
+      const endYear = end.getUTCFullYear()
+      const endMonth = end.getUTCMonth()
+
+      while (currentYear < endYear || (currentYear === endYear && currentMonth <= endMonth)) {
+        const d = new Date(Date.UTC(currentYear, currentMonth, 1))
+        const k = keyOf(d)
+        months.push({ 
+          key: k, 
+          label: d.toISOString().slice(0, 7), 
+          total: monthMap.get(k) || 0 
+        })
+        
+        currentMonth++
+        if (currentMonth > 11) {
+          currentMonth = 0
+          currentYear++
+        }
+      }
     }
 
     res.json({
       mode,
       label,
-      start: months[0]?.label,
-      end: months[months.length - 1]?.label,
+      start: months[0]?.label || null,
+      end: months[months.length - 1]?.label || null,
       points: months.map(m => ({ month: m.label, total_qty: m.total }))
     })
   } catch (e: any) {
